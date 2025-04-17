@@ -200,6 +200,25 @@ def get_grism_model_torch(this_spatial_model, this_disp_model, this_pupil, pixel
     wavs = wavs[order]
     dxs = dxs[order]
     dys = dys[order]
+    # print('Min Δλ in wavs:', (wavs[1:] - wavs[:-1]).min().item())
+
+    # Upsample wavelength grid
+    N_dense = 2000
+    wavs_dense = torch.linspace(wavs[0], wavs[-1], N_dense)
+
+    # Use torch-native linear interpolation
+    def interp1d(x, xp, fp):
+        # x: target values
+        idx = torch.searchsorted(xp, x, right=True).clamp(1, len(xp)-1)
+        x0 = xp[idx - 1]
+        x1 = xp[idx]
+        y0 = fp[idx - 1]
+        y1 = fp[idx]
+        weight = (x - x0) / (x1 - x0 + 1e-8)
+        return y0 + weight * (y1 - y0)
+
+    # dxs_dense = interp1d(wavs_dense, wavs, dxs)
+    # dys_dense = interp1d(wavs_dense, wavs, dys)
 
     # Interpolators (differentiable)
 
@@ -230,8 +249,10 @@ def get_grism_model_torch(this_spatial_model, this_disp_model, this_pupil, pixel
         wl_flat = line_wavelengths.flatten()
 
         # Interpolate dx and dy at each wavelength
-        dx_interp = torchinterp1d.interp1d(wavs, dxs, wl_flat)
-        dy_interp = torchinterp1d.interp1d(wavs, dys, wl_flat)
+        # dx_interp = torchinterp1d.interp1d(wavs, dxs, wl_flat)
+        # dy_interp = torchinterp1d.interp1d(wavs, dys, wl_flat)
+        dx_interp = interp1d(wl_flat, wavs, dxs)
+        dy_interp = interp1d(wl_flat, wavs, dys)
 
         # Add offset to source position
         x_G = x_flat + dx_interp
