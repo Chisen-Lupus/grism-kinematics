@@ -4,11 +4,11 @@ import numpy as np
 from astropy.modeling.models import Gaussian2D
 from scipy.special import gammaincinv
 from scipy.signal import fftconvolve
+import torch.nn.functional as F
 
+from . import utils
 
-
-#%% utility functions
-
+#%% numpy version of galaxy fitting models
 
 def sersic_model(xs, ys, I_e, R_e, n, x0=0.0, y0=0.0, q=1.0, theta=0.0, **kwargs):
     """
@@ -96,107 +96,7 @@ def full_image_model(x, y, psf, **kwargs):
     return image_conv
 
 
-
-def create_gaussian_psf(fwhm, size=25, ratio=1.0, theta=0.0):
-    """
-    Create a 2D Gaussian PSF using Astropy.
-
-    Parameters
-    ----------
-    fwhm : float
-        Full width at half maximum (FWHM) of the PSF (major axis).
-    size : int
-        Size of the PSF array (size x size).
-    ratio : float
-        Axis ratio b/a (1 = circular, <1 = elliptical).
-    theta : float
-        Position angle in radians (CCW from x-axis).
-
-    Returns
-    -------
-    psf : 2D ndarray
-        Normalized PSF array of shape (size, size).
-    """
-    sigma_major = fwhm / (2 * np.sqrt(2 * np.log(2)))
-    sigma_minor = sigma_major * ratio
-
-    x = np.linspace(-(size // 2), size // 2, size)
-    y = np.linspace(-(size // 2), size // 2, size)
-    xx, yy = np.meshgrid(x, y)
-
-    g2d = Gaussian2D(
-        amplitude=1.0,
-        x_mean=0, y_mean=0,
-        x_stddev=sigma_major,
-        y_stddev=sigma_minor,
-        theta=theta
-    )
-
-    psf = g2d(xx, yy)
-    psf /= psf.sum()  # Normalize
-
-    return psf
-
-
-#%% Torch utilities
-
-def fftconvolve_torch(in1, in2, mode='full'):
-    """
-    N-dimensional FFT-based convolution using PyTorch.
-    
-    Parameters
-    ----------
-    in1 : torch.Tensor
-        First input array.
-    in2 : torch.Tensor
-        Second input array. Must be same ndim as in1.
-    mode : str {'full', 'same', 'valid'}
-        Output size mode:
-        - 'full': full convolution (default)
-        - 'same': output same shape as in1
-        - 'valid': only regions where in2 fully overlaps in1
-
-    Returns
-    -------
-    out : torch.Tensor
-        Convolution result.
-    """
-    if in1.ndim != in2.ndim:
-        raise ValueError("Inputs must have same number of dimensions")
-
-    # Compute padded shape
-    s1 = torch.tensor(in1.shape)
-    s2 = torch.tensor(in2.shape)
-    shape = s1 + s2 - 1
-
-    # FFTs
-    fsize = [int(n) for n in shape]
-    fft1 = torch.fft.fftn(in1, s=fsize)
-    fft2 = torch.fft.fftn(in2, s=fsize)
-    out_fft = fft1 * fft2
-    out = torch.fft.ifftn(out_fft).real
-
-    if mode == 'full':
-        return out
-
-    elif mode == 'same':
-        # Crop to same shape as in1
-        start = (shape - s1) // 2
-        slices = tuple(slice(int(start[d]), int(start[d] + s1[d])) for d in range(in1.ndim))
-        return out[slices]
-
-    elif mode == 'valid':
-        valid_shape = s1 - s2 + 1
-        if torch.any(valid_shape < 1):
-            raise ValueError("in2 must not be larger than in1 in any dimension for 'valid' mode")
-        start = (s2 - 1)
-        end = start + valid_shape
-        slices = tuple(slice(int(start[d]), int(end[d])) for d in range(in1.ndim))
-        return out[slices]
-
-    else:
-        raise ValueError("mode must be 'full', 'same', or 'valid'")
-
+#%% torch version of galaxy fitting models
 
 def sersic_bn(n):
     """
@@ -216,7 +116,7 @@ def sersic_bn(n):
     return 2*n - 1/3 + 4/(405*n) + 46/(25515*n**2) + 131/(1148175*n**3)
 
 
-def sersic_model_torch(x, y, I_e, R_e, n, x0, y0, q, theta):
+def sersic_model_torch(x, y, I_e, R_e, n, x0, y0, q, theta, **kwargs):
     """
     Evaluate a Sérsic profile in PyTorch.
     Parameters can be tensors requiring gradients.
@@ -241,11 +141,7 @@ def sersic_model_torch(x, y, I_e, R_e, n, x0, y0, q, theta):
 
     model = I_e * torch.exp(exponent)
 
-    return model[torch.newaxis, torch.newaxis, ...]
-
-import torch.nn.functional as F
-
-from fft_conv_pytorch import fft_conv, FFTConv2d
+    return model
 
 
 def full_image_model_torch(x, y, psf, **kwargs):
@@ -272,6 +168,6 @@ def full_image_model_torch(x, y, psf, **kwargs):
     # Normalize PSF
     psf = psf / psf.sum()
 
-    image_conv = fftconvolve_torch(model, psf, mode='same')
+    image_conv = utils.fftconvolve_torch(model, psf, mode='same')
 
     return image_conv
