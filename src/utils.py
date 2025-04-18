@@ -288,3 +288,64 @@ def bilinear_shift_psf_torch(psf, dx, dy):
     # print(psf.dtype, grid.dtype)
     shifted = F.grid_sample(psf, grid, align_corners=True, padding_mode='zeros')[0, 0]
     return shifted
+
+
+def insert_shifted_psf_into_frame(psf, x0, y0, nx, ny):
+    """
+    Create an (ny, nx) image with the PSF centered at subpixel location (x0, y0).
+
+    Parameters
+    ----------
+    psf : (P, P) torch.Tensor
+        PSF kernel (assumed square and centered at (P//2, P//2)).
+    x0, y0 : float
+        Subpixel center location in the output image where the PSF peak should be placed.
+    nx, ny : int
+        Output image shape (width, height).
+
+    Returns
+    -------
+    frame : (ny, nx) torch.Tensor
+        Output image with the shifted PSF inserted.
+    """
+    P = psf.shape[-1]
+    device = psf.device
+
+    # Compute integer base location (top-left corner) for PSF insertion
+    x_base = int(torch.floor(x0)) - P // 2
+    y_base = int(torch.floor(y0)) - P // 2
+
+    # Subpixel offset from center of PSF
+    dx = x0 - torch.floor(x0)
+    dy = y0 - torch.floor(y0)
+
+    # Normalize shifts to [-1, 1] for grid_sample
+    shift_x = 2 * dx / (P - 1)
+    shift_y = 2 * dy / (P - 1)
+
+    # Create normalized sampling grid
+    coords = torch.linspace(-1, 1, P, device=device)
+    yy, xx = torch.meshgrid(coords, coords, indexing='ij')
+    grid = torch.stack((xx - shift_x, yy - shift_y), dim=-1).to(torch.float32)[None, ...]  # (1, P, P, 2)
+
+    # Apply bilinear shift via grid_sample
+    psf = psf[None, None, ...]  # (1, 1, P, P)
+    shifted_psf = F.grid_sample(psf, grid, align_corners=True, padding_mode='zeros')[0, 0]  # (P, P)
+
+    # Create blank frame
+    frame = torch.zeros((ny, nx), dtype=psf.dtype, device=device)
+
+    # Insert PSF into frame (clipped to boundaries if needed)
+    x_start = max(x_base, 0)
+    y_start = max(y_base, 0)
+    x_end = min(x_base + P, nx)
+    y_end = min(y_base + P, ny)
+
+    psf_x_start = max(0, -x_base)
+    psf_y_start = max(0, -y_base)
+    psf_x_end = psf_x_start + (x_end - x_start)
+    psf_y_end = psf_y_start + (y_end - y_start)
+
+    frame[y_start:y_end, x_start:x_end] = shifted_psf[psf_y_start:psf_y_end, psf_x_start:psf_x_end]
+
+    return frame
