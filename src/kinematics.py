@@ -127,3 +127,95 @@ def scatter_shifted_psf(xg, yg, intensities, psf, cutout=(0, 75, 100, 100)):
 
     return convolved
 
+
+def full_grism_model_torch(x, y, psf, cutout, emline_mask, **kwargs):
+
+    """
+    Generate a full model image using centered FFT-based convolution.
+
+    Parameters
+    ----------
+    x, y : 2D torch tensors
+        Coordinate grid.
+    psf : 2D torch tensor
+        PSF kernel, assumed centered and normalized.
+    kwargs : dict
+        velocity model parameters: V_rot, R_v, x0_v, y0_v, theta_v, inc_v
+        dispersion model parameters: wavelength_rest, grism_model
+        Sérsic model parameters: I_e, R_e, n, x0, y0, q, theta
+    emline_mask: 2D torch tensor or float
+        Filter the galaxy flux to the emline flux
+        If tensor then the shape should be the same as x, y
+
+    Returns
+    -------
+    image_conv : 2D torch tensor
+        The convolved model image.
+    """
+
+
+    vz = arctangent_disk_velocity_model(x, y, **kwargs)
+    x_G, y_G = dispersion_model(x, y, vz, **kwargs)
+    image_model = galaxy.sersic_model_torch(x, y, **kwargs)
+    
+    # plt.scatter(x_G.detach().numpy(), 
+    #             y_G.detach().numpy(), 
+    #             c=image_model.detach().numpy())
+    # plt.show()
+
+    # convolve with psf
+    I_flat = image_model.flatten()
+    xG_flat = x_G.flatten()
+    yG_flat = y_G.flatten()
+    # Build PSF model image
+    model_img = scatter_shifted_psf(xG_flat, yG_flat, I_flat, psf, cutout)
+    model_img = model_img*emline_mask
+
+    return model_img
+
+def full_grism_model_nonparametric_torch(image_model, psf, cutout, fratio, **kwargs):
+
+    """
+    Generate a full model image using centered FFT-based convolution.
+
+    Parameters TODO: change it
+    ----------
+    x, y : 2D torch tensors
+        Coordinate grid.
+    psf : 2D torch tensor
+        PSF kernel, assumed centered and normalized.
+    kwargs : dict
+        velocity model parameters: V_rot, R_v, x0_v, y0_v, theta_v, inc_v
+        dispersion model parameters: wavelength_rest, grism_model
+        Sérsic model parameters: I_e, R_e, n, x0, y0, q, theta
+
+    Returns
+    -------
+    image_conv : 2D torch tensor
+        The convolved model image.
+    """
+    device = image_model.device
+    nx, ny = image_model.shape
+    y, x = torch.meshgrid(
+        torch.linspace(0, nx - 1, nx, device=device),
+        torch.linspace(0, ny - 1, ny, device=device),
+        indexing='ij'
+    )
+
+    vz = arctangent_disk_velocity_model(x, y, **kwargs)
+    x_G, y_G = dispersion_model(x, y, vz, **kwargs)
+    
+    # plt.scatter(x_G.detach().numpy(), 
+    #             y_G.detach().numpy(), 
+    #             c=image_model.detach().numpy())
+    # plt.show()
+
+    # convolve with psf
+    I_flat = image_model.flatten()
+    xG_flat = x_G.flatten()
+    yG_flat = y_G.flatten()
+    # Build PSF model image
+    model_img = scatter_shifted_psf(xG_flat, yG_flat, I_flat, psf, cutout)
+    model_img = model_img*fratio
+
+    return model_img
