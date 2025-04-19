@@ -153,7 +153,7 @@ def fftconvolve_torch(in1, in2, mode='full'):
     else:
         raise ValueError("mode must be 'full', 'same', or 'valid'")
 
-def get_grism_model_torch(this_spatial_model, this_disp_model, this_pupil, pixelx, pixely):
+def get_grism_model_torch(this_spatial_model, this_disp_model, this_pupil, pixelx, pixely, direction='backward'):
     """
     Fully differentiable version of find_pixel_location_torch using torchinterp1d.
 
@@ -202,10 +202,6 @@ def get_grism_model_torch(this_spatial_model, this_disp_model, this_pupil, pixel
     dys = dys[order]
     # print('Min Δλ in wavs:', (wavs[1:] - wavs[:-1]).min().item())
 
-    # Upsample wavelength grid
-    N_dense = 2000
-    wavs_dense = torch.linspace(wavs[0], wavs[-1], N_dense)
-
     # Use torch-native linear interpolation
     def interp1d(x, xp, fp):
         # x: target values
@@ -222,49 +218,93 @@ def get_grism_model_torch(this_spatial_model, this_disp_model, this_pupil, pixel
 
     # Interpolators (differentiable)
 
-    def grism_model(x, y, line_wavelengths):
-        """
-        Compute grism image coordinates (x_G, y_G) from source position (x, y)
-        and wavelength image using interpolated trace model.
+    if direction.lower()=='backward': 
 
-        Parameters
-        ----------
-        x, y : (H, W) torch.Tensor
-            Source positions in detector space.
-        line_wavelengths : (H, W) torch.Tensor
-            Wavelength image at each pixel.
-        wavs : (M,) torch.Tensor
-            Wavelength grid of the trace model.
-        dxs, dys : (M,) torch.Tensor
-            Corresponding dx, dy offsets for each wav.
+        def grism_model(x, y, line_wavelengths):
+            """
+            Compute grism image coordinates (x_G, y_G) from source position (x, y)
+            and wavelength image using interpolated trace model.
 
-        Returns
-        -------
-        x_G, y_G : (H, W) torch.Tensor
-            Grism image coordinates.
-        """
-        # Flatten input for vectorized interpolation
-        x_flat = x.flatten()
-        y_flat = y.flatten()
-        wl_flat = line_wavelengths.flatten()
+            Parameters
+            ----------
+            x, y : (H, W) torch.Tensor
+                Source positions in detector space.
+            line_wavelengths : (H, W) torch.Tensor
+                Wavelength image at each pixel.
+            wavs : (M,) torch.Tensor
+                Wavelength grid of the trace model.
+            dxs, dys : (M,) torch.Tensor
+                Corresponding dx, dy offsets for each wav.
 
-        # Interpolate dx and dy at each wavelength
-        # dx_interp = torchinterp1d.interp1d(wavs, dxs, wl_flat)
-        # dy_interp = torchinterp1d.interp1d(wavs, dys, wl_flat)
-        dx_interp = interp1d(wl_flat, wavs, dxs)
-        dy_interp = interp1d(wl_flat, wavs, dys)
+            Returns
+            -------
+            x_G, y_G : (H, W) torch.Tensor
+                Grism image coordinates.
+            """
+            # Flatten input for vectorized interpolation
+            x_flat = x.flatten()
+            y_flat = y.flatten()
+            wl_flat = line_wavelengths.flatten()
 
-        # Add offset to source position
-        x_G = x_flat + dx_interp
-        y_G = y_flat + dy_interp
+            # Interpolate dx and dy at each wavelength
+            # dx_interp = torchinterp1d.interp1d(wavs, dxs, wl_flat)
+            # dy_interp = torchinterp1d.interp1d(wavs, dys, wl_flat)
+            dx_interp = interp1d(wl_flat, wavs, dxs)
+            dy_interp = interp1d(wl_flat, wavs, dys)
 
-        # Reshape back to image
-        x_G = x_G.view_as(x)
-        y_G = y_G.view_as(y)
+            # Add offset to source position
+            x_G = x_flat + dx_interp
+            y_G = y_flat + dy_interp
 
-        return x_G, y_G
+            # Reshape back to image
+            x_G = x_G.view_as(x)
+            y_G = y_G.view_as(y)
 
-    return grism_model 
+            return x_G, y_G
+
+        return grism_model 
+
+    elif direction.lower() == 'forward':
+
+        def grism_inverse_model(x_G, y_G, line_wavelengths):
+            """
+            Compute source plane coordinates (x, y) from grism image coordinates (x_G, y_G)
+            and wavelength using interpolated trace model.
+
+            Parameters
+            ----------
+            x_G, y_G : (H, W) torch.Tensor
+                Grism image coordinates.
+            line_wavelengths : (H, W) torch.Tensor
+                Wavelength image at each pixel.
+
+            Returns
+            -------
+            x, y : (H, W) torch.Tensor
+                Estimated source coordinates.
+            """
+            xG_flat = x_G.flatten()
+            yG_flat = y_G.flatten()
+            wl_flat = line_wavelengths.flatten()
+
+            # Interpolate dx and dy at each wavelength
+            dx_interp = interp1d(wl_flat, wavs, dxs)
+            dy_interp = interp1d(wl_flat, wavs, dys)
+
+            # Invert the transformation
+            x_flat = xG_flat - dx_interp
+            y_flat = yG_flat - dy_interp
+
+            # Reshape to image
+            x = x_flat.view_as(x_G)
+            y = y_flat.view_as(y_G)
+
+            return x, y
+
+        return grism_inverse_model
+    
+    else: 
+        raise ValueError('unknown transform direction')
 
 def bilinear_shift_psf_torch(psf, dx, dy):
     """
