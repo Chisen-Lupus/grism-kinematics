@@ -1,9 +1,13 @@
 import torch
 from . import galaxy, utils
 
+import matplotlib.pyplot as plt
+
+
 #%% kinematics models in torch
 def arctangent_disk_velocity_model(x, y, V_rot=200., R_v=2., x0_v=0., y0_v=0., theta_v=0., inc_v=0., **kwargs):
     """
+    TODO: change the name to torch
     Compute vx, vy, vz on the sky for a rotating disk using arctangent rotation curve.
 
     Parameters
@@ -82,8 +86,35 @@ def dispersion_model(x, y, vz, wavelength_rest, grism_model, dx=0., dy=0., **kwa
 
     return x_G, y_G
 
+def bilinear_interpolte_intensity_torch(xg, yg, intensities, cutout): 
+            
+        device = intensities.device
+        x0, y0, w, h = cutout
+        # print(x0, y0, w, h )
+        H, W = h, w
+        image = torch.zeros(h, w, device=device)
 
-def scatter_shifted_psf(xg, yg, intensities, psf, cutout=(0, 75, 100, 100)):
+        # Transform coordinates to cutout frame
+        xg_cut = xg - x0
+        yg_cut = yg - y0
+
+        # Scatter intensities using bilinear interpolation
+        x0 = torch.floor(xg_cut).long()
+        y0 = torch.floor(yg_cut).long()
+        dx = xg_cut - x0.float()
+        dy = yg_cut - y0.float()
+
+        for i in range(2):
+            for j in range(2):
+                w = ((1 - dx) if i == 0 else dx) * ((1 - dy) if j == 0 else dy)
+                xi = x0 + i
+                yj = y0 + j
+                valid = (xi >= 0) & (xi < W) & (yj >= 0) & (yj < H)
+                image.index_put_((yj[valid], xi[valid]), intensities[valid] * w[valid], accumulate=True)
+
+        return image
+
+def scatter_shifted_psf(xg, yg, intensities, psf, cutout):
     """
     Scatter intensity-weighted, subpixel-shifted PSFs into a full image.
 
@@ -100,35 +131,18 @@ def scatter_shifted_psf(xg, yg, intensities, psf, cutout=(0, 75, 100, 100)):
     -------
     image : (h, w) tensor - Model image of specified cutout region.
     """
-    device = xg.device
-    x0, y0, w, h = cutout
-    H, W = h, w
-    image = torch.zeros(h, w, device=device)
 
-    # Transform coordinates to cutout frame
-    xg_cut = xg - x0
-    yg_cut = yg - y0
-
-    # Scatter intensities using bilinear interpolation
-    x0 = torch.floor(xg_cut).long()
-    y0 = torch.floor(yg_cut).long()
-    dx = xg_cut - x0.float()
-    dy = yg_cut - y0.float()
-
-    for i in range(2):
-        for j in range(2):
-            w = ((1 - dx) if i == 0 else dx) * ((1 - dy) if j == 0 else dy)
-            xi = x0 + i
-            yj = y0 + j
-            valid = (xi >= 0) & (xi < W) & (yj >= 0) & (yj < H)
-            image.index_put_((yj[valid], xi[valid]), intensities[valid] * w[valid], accumulate=True)
+    image = bilinear_interpolte_intensity_torch(xg, yg, intensities, cutout)
 
     convolved = utils.fftconvolve_torch(image, psf, mode='same')
 
     return convolved
 
+    # return image
 
-def full_grism_model_torch(x, y, psf, cutout, emline_mask, **kwargs):
+#%% full grism models
+
+def full_grism_model_torch(x, y, psf, cutout, emline_mask=1., **kwargs):
 
     """
     Generate a full model image using centered FFT-based convolution.
@@ -173,7 +187,7 @@ def full_grism_model_torch(x, y, psf, cutout, emline_mask, **kwargs):
 
     return model_img
 
-def full_grism_model_nonparametric_torch(image_model, psf, cutout, fratio, **kwargs):
+def full_grism_model_nonparametric_torch(image_model, psf, cutout, emline_mask=1., **kwargs):
 
     """
     Generate a full model image using centered FFT-based convolution.
@@ -216,6 +230,39 @@ def full_grism_model_nonparametric_torch(image_model, psf, cutout, fratio, **kwa
     yG_flat = y_G.flatten()
     # Build PSF model image
     model_img = scatter_shifted_psf(xG_flat, yG_flat, I_flat, psf, cutout)
-    model_img = model_img*fratio
+    model_img = model_img*emline_mask
 
     return model_img
+
+# model ok; idea does not work
+
+def forward_dispersion_model(x_G, y_G, lambda_obs, forward_model, dx=0., dy=0., **kwargs):
+
+    x_G = x_G + dx
+    y_G = y_G + dy
+    x, y = forward_model(x_G, y_G, lambda_obs)
+
+    return x, y
+
+def full_forward_grism_model_torch(grism_image, lambda_test, cutout, oversample=2, 
+                                       **kwargs):
+    # TODO: oversample
+    nx_G, ny_G = grism_image.shape
+    y_G, x_G = torch.meshgrid(torch.arange(nx_G), torch.arange(ny_G))
+    x, y = forward_dispersion_model(x_G, y_G, lambda_test, **kwargs)
+
+    # print('cutout', cutout)
+    # plt.scatter(x.detach().numpy(), 
+    #             y.detach().numpy(), 
+    #             c=grism_image.detach().numpy())
+    # plt.show()
+
+
+    image = bilinear_interpolte_intensity_torch(x, y, grism_image, cutout)
+
+    dx = cutout[0] #+ cutout[2]//2
+    dy = cutout[1] #+ cutout[3]//2
+    vz = arctangent_disk_velocity_model(x-dx, y-dy, **kwargs)
+
+
+    return image, vz
