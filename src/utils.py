@@ -96,7 +96,7 @@ def coadd_images(images, weights=None):
 
 #%% utility functions in torch
 
-def fftconvolve_torch(in1, in2, mode='full'):
+def fftconvolve_torch(in1, in2, mode='same'):
     """
     N-dimensional FFT-based convolution using PyTorch.
     

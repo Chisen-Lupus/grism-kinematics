@@ -3,6 +3,10 @@ from . import galaxy, utils
 
 import matplotlib.pyplot as plt
 
+import logging
+LOG = logging.getLogger(__name__)  # This will inherit the root logger's config if set
+LOG.addHandler(logging.NullHandler())  # Prevents "No handler found" warning if root isn't configured
+
 
 #%% kinematics models in torch
 def arctangent_disk_velocity_model(x, y, V_rot=200., R_v=2., x0_v=0., y0_v=0., theta_v=0., inc_v=0., **kwargs):
@@ -266,3 +270,30 @@ def full_forward_grism_model_torch(grism_image, lambda_test, cutout, oversample=
 
 
     return image, vz
+
+# finally worked version, iteratively find xy
+
+def iteratively_find_xy(x_init, y_init, cutout, lambda_rest, x_G, y_G, 
+                        maxiter=50, tol=1e-3, alpha=0.5, **kwargs):
+    c = 299792.458  # speed of light in km/s
+
+    # find x and y
+    dx = cutout[0] #+ cutout[2]//2
+    dy = cutout[1] #+ cutout[3]//2
+    x = x_init.detach()
+    y = y_init.detach()
+    for k in range(maxiter):
+        vz_new = arctangent_disk_velocity_model(x-dx, y-dy, **kwargs)
+        lambda_new = lambda_rest * (1.0 + vz_new / c)
+        x_new, y_new = forward_dispersion_model(x_G, y_G, lambda_new, **kwargs)
+        # print(torch.max(torch.abs(x_new - x)), torch.max(torch.abs(y_new - y)))
+        if torch.max(torch.abs(x_new - x)) < tol and \
+           torch.max(torch.abs(y_new - y)) < tol:
+            x = alpha*x + (1 - alpha)*x_new
+            y = alpha*y + (1 - alpha)*y_new
+            break
+        x = alpha*x + (1 - alpha)*x_new
+        y = alpha*y + (1 - alpha)*y_new
+    if k+1>=maxiter: LOG.warning('maxiter reached but xy do not converge to 0')
+
+    return x, y, vz_new, k 
