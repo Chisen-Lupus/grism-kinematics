@@ -1,8 +1,18 @@
 # Grism calibration functions 
 
+import os
 import numpy as np
 from astropy.io import ascii, fits
 from scipy import interpolate
+
+def get_grism_cal_dir():
+    grism_cal_dir = os.getenv('GRISM_CAL_DIR')
+    # If not set, use default
+    if grism_cal_dir is None:
+        grism_cal_dir = '/data/grism_cal'
+    if not os.path.isdir(grism_cal_dir):
+        raise FileNotFoundError(f'Grism calibration directory not found: {grism_cal_dir}')
+    return grism_cal_dir
 
 
 #%% Copied from Fengwu's code
@@ -136,23 +146,23 @@ def load_nircam_wfss_model(pupil, module, filter):
     elif tmp_filter in ['F410M', 'F444W', 'F480M']: disp_filter = 'F444W' 
 
     # dir_wavecal = '/home/u24/fengwusun/Comissioning/FS_grism_config_v3_202406/'
-    tb_order23_fit_AR = ascii.read('/data/grism_cal/dy_dx_tracing_model/DISP_%s_mod%s_grism%s.dat' % (disp_filter, 'A', 'R'))
+    tb_order23_fit_AR = ascii.read(os.path.join(get_grism_cal_dir(), 'dy_dx_tracing_model/DISP_%s_mod%s_grism%s.dat' % (disp_filter, 'A', 'R')))
     fit_opt_fit_AR, fit_err_fit_AR = tb_order23_fit_AR['col0'].data, tb_order23_fit_AR['col1'].data
-    tb_order23_fit_BR = ascii.read('/data/grism_cal/dy_dx_tracing_model/DISP_%s_mod%s_grism%s.dat' % (disp_filter, 'B', 'R'))
+    tb_order23_fit_BR = ascii.read(os.path.join(get_grism_cal_dir(), 'dy_dx_tracing_model/DISP_%s_mod%s_grism%s.dat' % (disp_filter, 'B', 'R')))
     fit_opt_fit_BR, fit_err_fit_BR = tb_order23_fit_BR['col0'].data, tb_order23_fit_BR['col1'].data
-    tb_order23_fit_AC = ascii.read('/data/grism_cal/dy_dx_tracing_model/DISP_%s_mod%s_grism%s.dat' % (disp_filter, 'A', 'C'))
+    tb_order23_fit_AC = ascii.read(os.path.join(get_grism_cal_dir(), 'dy_dx_tracing_model/DISP_%s_mod%s_grism%s.dat' % (disp_filter, 'A', 'C')))
     fit_opt_fit_AC, fit_err_fit_AC = tb_order23_fit_AC['col0'].data, tb_order23_fit_AC['col1'].data
-    tb_order23_fit_BC = ascii.read('/data/grism_cal/dy_dx_tracing_model/DISP_%s_mod%s_grism%s.dat' % (disp_filter, 'B', 'C'))
+    tb_order23_fit_BC = ascii.read(os.path.join(get_grism_cal_dir(), 'dy_dx_tracing_model/DISP_%s_mod%s_grism%s.dat' % (disp_filter, 'B', 'C')))
     fit_opt_fit_BC, fit_err_fit_BC = tb_order23_fit_BC['col0'].data, tb_order23_fit_BC['col1'].data
 
     ### grism dispersion parameters:
-    tb_fit_displ_AR = ascii.read('/data/grism_cal/dx_wave_dispersion_model/DISPL_mod%s_grism%s.dat' % ('A', "R"))
+    tb_fit_displ_AR = ascii.read(os.path.join(get_grism_cal_dir(), 'dx_wave_dispersion_model/DISPL_mod%s_grism%s.dat' % ('A', "R")))
     w_opt_AR, w_err_AR = tb_fit_displ_AR['col0'].data, tb_fit_displ_AR['col1'].data
-    tb_fit_displ_BR = ascii.read('/data/grism_cal/dx_wave_dispersion_model/DISPL_mod%s_grism%s.dat' % ('B', "R"))
+    tb_fit_displ_BR = ascii.read(os.path.join(get_grism_cal_dir(), 'dx_wave_dispersion_model/DISPL_mod%s_grism%s.dat' % ('B', "R")))
     w_opt_BR, w_err_BR = tb_fit_displ_BR['col0'].data, tb_fit_displ_BR['col1'].data
-    tb_fit_displ_AC = ascii.read('/data/grism_cal/dx_wave_dispersion_model/DISPL_mod%s_grism%s.dat' % ('A', "C"))
+    tb_fit_displ_AC = ascii.read(os.path.join(get_grism_cal_dir(), 'dx_wave_dispersion_model/DISPL_mod%s_grism%s.dat' % ('A', "C")))
     w_opt_AC, w_err_AC = tb_fit_displ_AC['col0'].data, tb_fit_displ_AC['col1'].data
-    tb_fit_displ_BC = ascii.read('/data/grism_cal/dx_wave_dispersion_model/DISPL_mod%s_grism%s.dat' % ('B', "C"))
+    tb_fit_displ_BC = ascii.read(os.path.join(get_grism_cal_dir(), 'dx_wave_dispersion_model/DISPL_mod%s_grism%s.dat' % ('B', "C")))
     w_opt_BC, w_err_BC = tb_fit_displ_BC['col0'].data, tb_fit_displ_BC['col1'].data
 
     ### list of module/pupil and corresponding tracing/dispersion function:
@@ -161,7 +171,7 @@ def load_nircam_wfss_model(pupil, module, filter):
     list_w_opt       = np.array([w_opt_AR, w_opt_BR, w_opt_AC, w_opt_BC])
 
     ### Sensitivity curve:
-    dir_fluxcal = '/data/grism_cal/sensitivity_model/'
+    dir_fluxcal = os.path.join(get_grism_cal_dir(), 'sensitivity_model/')
     # dir_fluxcal = '/home/u24/fengwusun/Comissioning/cycle1_cal_program/fluxcal/product/'
     tb_sens_AR = ascii.read(dir_fluxcal + '%s_mod%s_grism%s_sensitivity.dat' % (tmp_filter, 'A', 'R'))
     tb_sens_BR = ascii.read(dir_fluxcal + '%s_mod%s_grism%s_sensitivity.dat'% (tmp_filter, 'B', 'R'))
