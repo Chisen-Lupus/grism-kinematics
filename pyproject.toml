@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "DINGO"
+version = "0.1.0"
+description = "Dispersion-based INference for Galaxy Observations using R+C Grism Data"
+authors = [
+  {name = "Yichen Liu", email = "yichenliu@arizona.edu"}
+]
+requires-python = ">=3.8"
+dependencies = [
+  "numpy",
+  "torch",
+  "astropy",
+  "matplotlib",
+  "reproject",
+]
+readme = "README.md"
+license = "MIT"
+
+[tool.setuptools.packages.find]
+include = ["dingo"]
