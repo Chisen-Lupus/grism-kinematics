@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "setuptools_scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "DINGO"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Dispersion-based INference for Galaxy Observations using R+C Grism Data"
 authors = [
   {name = "Yichen Liu", email = "yichenliu@arizona.edu"}
@@ -22,3 +22,7 @@ license = "MIT"
 
 [tool.setuptools.packages.find]
 include = ["dingo"]
+
+[tool.setuptools_scm]
+version_scheme = "no-guess-dev"
+local_scheme = "node"
