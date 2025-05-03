@@ -1,8 +1,7 @@
-# TODO: logging
-
 import torch
 import logging
-from typing import Dict
+import yaml
+from typing import Dict, AnyStr
 from abc import ABC, abstractmethod
 
 
@@ -43,6 +42,94 @@ def collect_named_trainable_params(**kwargs):
                 seen_ids.add(id(val))
 
     return named_params
+
+
+def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    summary = config['summary']
+    image_config = config['image']
+    velocity_config = config['velocity']
+    fitting_config = config['fitting'][0]  # use the first strategy for now
+
+    # Set up r_fit and wavelength
+    r_fit = summary['r_fit']
+    lambda_rest = torch.tensor([summary['lambda_rest']]) * (1 + summary['z'])
+
+    # Convert images to tensors
+    true_grism_R = torch.tensor(coadd_R, dtype=torch.float32, device=device)
+    true_grism_C = torch.tensor(coadd_C, dtype=torch.float32, device=device)
+
+    # Build forward models
+    fwd_models = {}
+    for pupil in ['R', 'C']:
+        _, spatial_model, disp_model = grism.load_nircam_wfss_model(
+            pupil, image_config[pupil]['module'], summary['filter']
+        )
+        fwd_models[pupil] = utils.get_grism_model_torch(
+            spatial_model, disp_model, pupil, 1024, 1024, direction='forward'
+        )
+
+    # Build velocity params
+    velocity_params = {}
+    for key in ['V_rot', 'R_v', 'x0_v', 'y0_v', 'theta_v', 'inc_v']:
+        val = velocity_config[key]
+        velocity_params[key] = torch.tensor(val, dtype=torch.float32, requires_grad=True, device=device)
+
+    # Pixel grid
+    nx_G, ny_G = true_grism_R.shape
+    y_G, x_G = torch.meshgrid(torch.arange(nx_G), torch.arange(ny_G), indexing='ij')
+
+    # Cutout centers
+    cx_R, cy_R = fwd_models['R'](torch.tensor(r_fit), torch.tensor(r_fit), lambda_rest)
+    cx_C, cy_C = fwd_models['C'](torch.tensor(r_fit), torch.tensor(r_fit), lambda_rest)
+    cutout_R = (int(cx_R)-r_fit, int(cy_R)-r_fit, 2*r_fit+1, 2*r_fit+1)
+    cutout_C = (int(cx_C)-r_fit, int(cy_C)-r_fit, 2*r_fit+1, 2*r_fit+1)
+
+    # Dispersion parameters
+    dispersion_params = {}
+    for pupil in ['R', 'C']:
+        dispersion_params[pupil] = {
+            'forward_model': fwd_models[pupil],
+            'dx': torch.tensor(image_config[pupil]['dx'], dtype=torch.float32, requires_grad=True, device=device),
+            'dy': torch.tensor(image_config[pupil]['dy'], dtype=torch.float32, requires_grad=True, device=device),
+        }
+
+    # Learning rate settings
+    default_lr = fitting_config['default']['lr']
+    overrides = fitting_config['override']
+    param_groups = []
+    named_params = collect_named_trainable_params(
+        velocity_params=velocity_params,
+        dispersion_params_R=dispersion_params['R'],
+        dispersion_params_C=dispersion_params['C'],
+    )
+
+    for name, p in named_params.items():
+        if name in overrides and 'lr' in overrides[name]:
+            param_groups.append({'params': [p], 'lr': overrides[name]['lr']})
+        else:
+            param_groups.append({'params': [p], 'lr': default_lr})
+
+    return {
+        'true_grism_R': true_grism_R,
+        'true_grism_C': true_grism_C,
+        'velocity_params': velocity_params,
+        'dispersion_params_R': dispersion_params['R'],
+        'dispersion_params_C': dispersion_params['C'],
+        'cutout_R': cutout_R,
+        'cutout_C': cutout_C,
+        'lambda_rest': lambda_rest,
+        'x_G': x_G,
+        'y_G': y_G,
+        'param_groups': param_groups,
+        'fwd_models': fwd_models,
+        'r_fit': r_fit,
+        'summary': summary,
+        'fitting_config': fitting_config,
+    }
+
     
 #%% --------------------------------------------------------------------------
 # basic abstract class as interface
@@ -68,138 +155,85 @@ class BaseFitter(ABC):
 # Kinematics fitting class
 # ----------------------------------------------------------------------------
 
-class KinemtaicsFitter(BaseFitter):
+class KinematicsFitter(BaseFitter):
 
-    def __init__(self, coadd_R, coadd_C, config: Dict, device=None): 
+    def __init__(self, coadd_R, coadd_C, config: AnyStr, device=None):
+        config_dict = load_config_and_initialize(config, coadd_R, coadd_C, device)
 
-        # Data Preparation
+        # ─────────────────────────────
+        # Summary / Metadata
+        # ─────────────────────────────
+        summary = config_dict['summary']
+        self.name = summary['name']
+        self.ra = summary['ra']
+        self.dec = summary['dec']
+        self.z = summary['z']
+        self.filter = summary['filter']
+        self.mode = summary['mode']
+        self.r_fit = config_dict['r_fit']
 
-        # R data
+        # ─────────────────────────────
+        # Core data
+        # ─────────────────────────────
+        self.true_grism_R = config_dict['true_grism_R']
+        self.true_grism_C = config_dict['true_grism_C']
+        self.lambda_rest = config_dict['lambda_rest']
+        self.cutout_R = config_dict['cutout_R']
+        self.cutout_C = config_dict['cutout_C']
+        self.x_G = config_dict['x_G']
+        self.y_G = config_dict['y_G']
 
-        self.true_grism_R = torch.tensor(coadd_R, dtype=torch.float32, device=device)
+        # ─────────────────────────────
+        # Model parameters
+        # ─────────────────────────────
+        self.velocity_params = config_dict['velocity_params']
+        self.dispersion_params_R = config_dict['dispersion_params_R']
+        self.dispersion_params_C = config_dict['dispersion_params_C']
 
-        # BUG: R+B will cause the x and y not converge
-        _, spatial_model, disp_model = grism.load_nircam_wfss_model('R', 'A', 'F444W')
-        self.forward_model_R = utils.get_grism_model_torch(
-            spatial_model, disp_model, 'R', 1024, 1024, direction='forward'
-        )
-
-        # C data
-
-        self.true_grism_C = torch.tensor(coadd_C, dtype=torch.float32, device=device)
-
-        _, spatial_model, disp_model = grism.load_nircam_wfss_model('C', 'A', 'F444W')
-        self.forward_model_C = utils.get_grism_model_torch(
-            spatial_model, disp_model, 'C', 1024, 1024, direction='forward'
-        )
-
-
-        if not device: 
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        r_fit = 40
-
-        # params to be fitted
-
-        self.V_rot = torch.tensor(-500.0, requires_grad=True, device=device)
-        self.R_v = torch.tensor(10.0, requires_grad=True, device=device)
-        self.x0_v = torch.tensor(r_fit+0., requires_grad=False, device=device)
-        self.y0_v = torch.tensor(r_fit+0., requires_grad=False, device=device)
-        self.theta_v = torch.tensor(-1., requires_grad=True, device=device)
-        self.inc_v = torch.tensor(1., requires_grad=True, device=device)
-
-        self.dx_R = torch.tensor(-2., requires_grad=True, device=device)
-        self.dy_R = torch.tensor(-4., requires_grad=True, device=device)
-
-        self.dx_C = torch.tensor(-2., requires_grad=True, device=device)
-        self.dy_C = torch.tensor(-5., requires_grad=True, device=device)
-
-
-        self.velocity_params = {
-            'V_rot': self.V_rot,
-            'R_v': self.R_v,
-            'x0_v': self.x0_v,
-            'y0_v': self.y0_v,
-            'theta_v': self.theta_v,
-            'inc_v': self.inc_v,
-        }
-
-        self.dispersion_params_R = {
-            'forward_model': self.forward_model_R, 
-            'dx': self.dx_R,
-            'dy': self.dy_R,
-        }
-
-        self.dispersion_params_C = {
-            'forward_model': self.forward_model_C, 
-            'dx': self.dx_C,
-            'dy': self.dy_C,
-        }
-
-        # spectral information
-        z = 1.123
-        self.lambda_rest = torch.tensor([1.875])*(1 + z) # nm, Pa alpha
-        nx_G, ny_G = self.true_grism_R.shape
-        self.y_G, self.x_G = torch.meshgrid(
-            torch.arange(nx_G), torch.arange(ny_G), indexing='ij')
-        # fitting area XXX
-        cx_R, cy_R = self.forward_model_R(
-            torch.tensor(r_fit), torch.tensor(r_fit), self.lambda_rest)
-        cx_C, cy_C = self.forward_model_C(
-            torch.tensor(r_fit), torch.tensor(r_fit), self.lambda_rest)
-        self.cutout_R = (int(cx_R)-r_fit, int(cy_R)-r_fit, 2*r_fit+1, 2*r_fit+1)
-        self.cutout_C = (int(cx_C)-r_fit, int(cy_C)-r_fit, 2*r_fit+1, 2*r_fit+1)
-
-        
-        # temporary parameters to be used in the training loop
+        # ─────────────────────────────
+        # Temporary variables (state)
+        # ─────────────────────────────
         self.x_R, self.y_R = kinematics.forward_dispersion_model(
-            self.x_G, self.y_G, self.lambda_rest, **self.dispersion_params_R)
+            self.x_G, self.y_G, self.lambda_rest, **self.dispersion_params_R
+        )
         self.x_C, self.y_C = kinematics.forward_dispersion_model(
-            self.x_G, self.y_G, self.lambda_rest, **self.dispersion_params_C)
+            self.x_G, self.y_G, self.lambda_rest, **self.dispersion_params_C
+        )
         self.iter_R = None
         self.iter_C = None
 
-        
-        # outputs 
         self.image_R = None
         self.image_C = None
         self.vz_R = None
         self.vz_C = None
 
-        # fitting checkpoints
-        self.lrs = None
-        self.losses = None
+        # ─────────────────────────────
+        # Fitting strategy and optimizer
+        # ─────────────────────────────
+        fitting = config_dict['fitting_config']
+        self.maxiter = fitting['maxiter']
+        self.losses = []
+        self.lrs = []
 
-        # prepare optimizer, scheduler, and maxiter
+        self.optimizer = torch.optim.Adam(config_dict['param_groups'])
 
-        named_params = collect_named_trainable_params(
-            velocity_params=self.velocity_params,
-            dispersion_params_R=self.dispersion_params_R,
-            dispersion_params_C=self.dispersion_params_C,
-        )
-
-        param_groups = []
-        for name, p in named_params.items():
-            if name in ['velocity_params.V_rot', 'velocity_params.R_v']:
-                param_groups.append({'params': [p], 'lr': 0.03})
-            elif name in ['dispersion_params_R.dx', 'dispersion_params_R.dy']:
-                param_groups.append({'params': [p], 'lr': 0.3})
-            elif name in ['dispersion_params_C.dx', 'dispersion_params_C.dy']:
-                param_groups.append({'params': [p], 'lr': 0.3})
-            else:
-                param_groups.append({'params': [p], 'lr': 0.03})
-
-        self.optimizer = torch.optim.Adam(param_groups)
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.707,
-            patience=500,
-            min_lr=1e-6
-        )
-        # self.scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=np.sqrt(0.1))
-
-
-        self.maxiter = 10000
+        scheduler_type = fitting['scheduler']
+        if scheduler_type == 'ReduceLROnPlateau':
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=0.707,
+                patience=500,
+                min_lr=1e-6
+            )
+        elif scheduler_type == 'StepLR':
+            self.scheduler = torch.optim.lr_scheduler.StepLR(
+                self.optimizer,
+                step_size=2000,
+                gamma=0.1
+            )
+        else:
+            raise ValueError(f'Unsupported scheduler type: {scheduler_type}')
 
 
     # loss functions  --------------------------------------------------------
