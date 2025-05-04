@@ -33,6 +33,10 @@ class FitParamConfig:
     vmax: float
     fit: bool
 
+    def __post_init__(self):
+        self.vmin = float(self.vmin)
+        self.vmax = float(self.vmax)
+
     def to_tensor(self, device=None):
         if not isinstance(self.value, (int, float)):
             raise TypeError(f"Cannot convert non-numeric value to tensor: {self.value}")
@@ -40,6 +44,12 @@ class FitParamConfig:
             self.value, dtype=torch.float32,
             requires_grad=self.fit, device=device
         )
+
+    def __repr__(self):
+        return (f'FitParamConfig(name={self.name}, value={self.value}, '
+                f'lr={self.lr}, fit={self.fit}, '
+                f'vmin={self.vmin}, vmax={self.vmax})')
+
 
 def collect_named_trainable_params(**kwargs):
     seen_ids = set()
@@ -151,9 +161,12 @@ def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
 
     # Build param groups only for those with fit=True
     param_groups = []
+    clamp_list = []  # ✅ collect tensors + clamp info here
     for cfg in list(velocity_cfg.values()) + list(dispersion_cfgs['R'].values()) + list(dispersion_cfgs['C'].values()):
         if cfg.fit:
-            param_groups.append({'params': [cfg.tensor], 'lr': cfg.lr})
+            tensor = cfg.tensor
+            param_groups.append({'params': [tensor], 'lr': cfg.lr})
+            clamp_list.append((tensor, cfg.vmin, cfg.vmax))  # ✅ add clamp tuple
 
     return {
         'true_grism_R': true_grism_R,
@@ -167,6 +180,7 @@ def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
         'x_G': x_G,
         'y_G': y_G,
         'param_groups': param_groups,
+        'clamp_list': clamp_list,  # ✅ add to output
         'fwd_models': fwd_models,
         'r_fit': r_fit,
         'summary': summary,
@@ -245,6 +259,7 @@ class KinematicsFitter(BaseFitter):
         self.iter_R = None
         self.iter_C = None
 
+        # variables to be returned
         self.image_R = None
         self.image_C = None
         self.vz_R = None
@@ -259,6 +274,7 @@ class KinematicsFitter(BaseFitter):
         self.lrs = []
 
         self.optimizer = torch.optim.Adam(config_dict['param_groups'])
+        self.clamp_list = config_dict['clamp_list']
 
         scheduler_type = fitting['scheduler']
         if scheduler_type == 'ReduceLROnPlateau':
@@ -316,18 +332,18 @@ class KinematicsFitter(BaseFitter):
 
         self.losses = []
         self.lrs = []
-        try: 
+        try:
             for i in range(self.maxiter):
 
                 self.optimizer.zero_grad()
-                
+
                 # NOTE: reusing x/y_R/C will accelerate finding xy
                 loss = self.loss()
 
                 lr = self.optimizer.param_groups[0]['lr']
-                if i==0:
+                if i == 0:
                     LOG.info(f'Starting, loss={loss.item():.3f}, lr={lr:.5f}, maxiters finding xy={(self.iter_R, self.iter_C)}')
-                if (i+1)%500==0:
+                if (i + 1) % 500 == 0:
                     LOG.info(f'Step {i+1}, loss={loss.item():.3f}, lr={lr:.5f}, maxiters finding xy={(self.iter_R, self.iter_C)}')
 
                 loss.backward()
@@ -335,20 +351,17 @@ class KinematicsFitter(BaseFitter):
                 self.scheduler.step(loss)
                 self.losses.append(loss.item())
                 self.lrs.append(lr)
-                
-                # TODO: apply data clamp
-                # theta_v.data.clamp_(min=0., max=torch.pi)
-                # inc_v.data.clamp_(min=0., max=torch.pi/2)
 
-                # break 
+                # ✅ Apply clamping based on config
+                for p, vmin, vmax in self.clamp_list:
+                    p.data.clamp_(min=vmin, max=vmax)
 
-        # make sure the result is saved when interrupted
-        except Exception as e: 
+        except Exception as e:
             print(repr(e))
             pass
 
         return self.losses, self.lrs
-    
+
     # getters and setters ----------------------------------------------------
 
     def get_fitting_results(self): 
