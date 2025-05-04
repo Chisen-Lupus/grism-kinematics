@@ -2,7 +2,9 @@ import torch
 import logging
 import yaml
 from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from astropy.io import fits
+import numpy as np
+from typing import Dict, Any, Optional, AnyStr
 from abc import ABC, abstractmethod
 
 
@@ -49,6 +51,9 @@ class FitParamConfig:
         return (f'FitParamConfig(name={self.name}, value={self.value}, '
                 f'lr={self.lr}, fit={self.fit}, '
                 f'vmin={self.vmin}, vmax={self.vmax})')
+    
+    def __str__(self):
+        return self.__repr__()
 
 
 def collect_named_trainable_params(**kwargs):
@@ -96,14 +101,20 @@ def build_param_config_dict(param_dict, default_cfg, overrides, prefix, device=N
             fit=override_cfg.get('fit', default_cfg['fit'])
         )
 
-        tensor = param_cfg.to_tensor(device=device)  # ✅ Only call to_tensor once
+        tensor = param_cfg.to_tensor(device=device)  # Only call to_tensor once
         config_map[full_key] = param_cfg
         tensor_map[name] = tensor
-        param_cfg.tensor = tensor  # ✅ Bind it back to config for param_groups
+        param_cfg.tensor = tensor  # Bind it back to config for param_groups
 
     return tensor_map, config_map
 
-def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
+def load_fits_data(path_hdu):
+    path, hdu_index = path_hdu
+    with fits.open(path) as hdu: 
+        data = hdu[hdu_index].data
+    return np.array(data, dtype=np.float32)
+
+def load_config_and_initialize(config_path, device=None):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -118,7 +129,10 @@ def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
     r_fit = summary['r_fit']
     lambda_rest = torch.tensor([summary['lambda_rest']]) * (1 + summary['z'])
 
-    # Convert images to tensors
+    # load image and convert to tensors
+    coadd_R = load_fits_data(image_config['R']['path'])
+    coadd_C = load_fits_data(image_config['C']['path'])
+
     true_grism_R = torch.tensor(coadd_R, dtype=torch.float32, device=device)
     true_grism_C = torch.tensor(coadd_C, dtype=torch.float32, device=device)
 
@@ -161,12 +175,12 @@ def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
 
     # Build param groups only for those with fit=True
     param_groups = []
-    clamp_list = []  # ✅ collect tensors + clamp info here
+    clamp_list = []
     for cfg in list(velocity_cfg.values()) + list(dispersion_cfgs['R'].values()) + list(dispersion_cfgs['C'].values()):
         if cfg.fit:
             tensor = cfg.tensor
             param_groups.append({'params': [tensor], 'lr': cfg.lr})
-            clamp_list.append((tensor, cfg.vmin, cfg.vmax))  # ✅ add clamp tuple
+            clamp_list.append((tensor, cfg.vmin, cfg.vmax))
 
     return {
         'true_grism_R': true_grism_R,
@@ -180,7 +194,7 @@ def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
         'x_G': x_G,
         'y_G': y_G,
         'param_groups': param_groups,
-        'clamp_list': clamp_list,  # ✅ add to output
+        'clamp_list': clamp_list,
         'fwd_models': fwd_models,
         'r_fit': r_fit,
         'summary': summary,
@@ -214,8 +228,8 @@ class BaseFitter(ABC):
 
 class KinematicsFitter(BaseFitter):
 
-    def __init__(self, coadd_R, coadd_C, config: Any, device=None):
-        config_dict = load_config_and_initialize(config, coadd_R, coadd_C, device)
+    def __init__(self, config_path, device=None):
+        config_dict = load_config_and_initialize(config_path, device=device)
 
         # ─────────────────────────────
         # Summary / Metadata
