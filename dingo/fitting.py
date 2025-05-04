@@ -1,7 +1,8 @@
 import torch
 import logging
 import yaml
-from typing import Dict, AnyStr
+from dataclasses import dataclass
+from typing import Dict, Any, Optional
 from abc import ABC, abstractmethod
 
 
@@ -23,6 +24,22 @@ if not LOG.handlers:
 #%% --------------------------------------------------------------------------
 # helper functions
 # ----------------------------------------------------------------------------
+@dataclass
+class FitParamConfig:
+    name: str
+    value: float
+    lr: float
+    vmin: float
+    vmax: float
+    fit: bool
+
+    def to_tensor(self, device=None):
+        if not isinstance(self.value, (int, float)):
+            raise TypeError(f"Cannot convert non-numeric value to tensor: {self.value}")
+        return torch.tensor(
+            self.value, dtype=torch.float32,
+            requires_grad=self.fit, device=device
+        )
 
 def collect_named_trainable_params(**kwargs):
     seen_ids = set()
@@ -43,6 +60,38 @@ def collect_named_trainable_params(**kwargs):
 
     return named_params
 
+def build_param_config_dict(param_dict, default_cfg, overrides, prefix, device=None):
+    tensor_map = {}
+    config_map = {}
+
+    allowed_keys = {
+        'velocity': {'V_rot', 'R_v', 'x0_v', 'y0_v', 'theta_v', 'inc_v'},
+        'image.R': {'dx', 'dy'},
+        'image.C': {'dx', 'dy'}
+    }
+
+    for name, value in param_dict.items():
+        full_key = f'{prefix}.{name}'
+        if name not in allowed_keys.get(prefix, set()):
+            tensor_map[name] = value  # Keep non-numerical entries as-is
+            continue
+
+        override_cfg = overrides.get(full_key, {})
+        param_cfg = FitParamConfig(
+            name=full_key,
+            value=value,
+            lr=override_cfg.get('lr', default_cfg['lr']),
+            vmin=override_cfg.get('vmin', default_cfg['vmin']),
+            vmax=override_cfg.get('vmax', default_cfg['vmax']),
+            fit=override_cfg.get('fit', default_cfg['fit'])
+        )
+
+        tensor = param_cfg.to_tensor(device=device)  # ✅ Only call to_tensor once
+        config_map[full_key] = param_cfg
+        tensor_map[name] = tensor
+        param_cfg.tensor = tensor  # ✅ Bind it back to config for param_groups
+
+    return tensor_map, config_map
 
 def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
     with open(config_path, 'r') as f:
@@ -50,8 +99,10 @@ def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
 
     summary = config['summary']
     image_config = config['image']
-    velocity_config = config['velocity']
-    fitting_config = config['fitting'][0]  # use the first strategy for now
+    velocity_config_raw = config['velocity']
+    fitting_config = config['fitting'][0]  # TODO: now only use the first strategy
+    default_cfg = fitting_config['default']
+    overrides = fitting_config['override']
 
     # Set up r_fit and wavelength
     r_fit = summary['r_fit']
@@ -71,11 +122,22 @@ def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
             spatial_model, disp_model, pupil, 1024, 1024, direction='forward'
         )
 
-    # Build velocity params
-    velocity_params = {}
-    for key in ['V_rot', 'R_v', 'x0_v', 'y0_v', 'theta_v', 'inc_v']:
-        val = velocity_config[key]
-        velocity_params[key] = torch.tensor(val, dtype=torch.float32, requires_grad=True, device=device)
+    # Velocity parameters
+    velocity_params, velocity_cfg = build_param_config_dict(
+        velocity_config_raw, default_cfg, overrides, prefix='velocity', device=device
+    )
+
+    # Dispersion parameters
+    dispersion_params = {}
+    dispersion_cfgs = {}
+    for pupil in ['R', 'C']:
+        param_dict = {k: image_config[pupil][k] for k in ['dx', 'dy'] if k in image_config[pupil]}
+        disp_params, disp_cfg = build_param_config_dict(
+            param_dict, default_cfg, overrides, prefix=f'image.{pupil}', device=device
+        )
+        disp_params['forward_model'] = fwd_models[pupil]
+        dispersion_params[pupil] = disp_params
+        dispersion_cfgs[pupil] = disp_cfg
 
     # Pixel grid
     nx_G, ny_G = true_grism_R.shape
@@ -87,30 +149,11 @@ def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
     cutout_R = (int(cx_R)-r_fit, int(cy_R)-r_fit, 2*r_fit+1, 2*r_fit+1)
     cutout_C = (int(cx_C)-r_fit, int(cy_C)-r_fit, 2*r_fit+1, 2*r_fit+1)
 
-    # Dispersion parameters
-    dispersion_params = {}
-    for pupil in ['R', 'C']:
-        dispersion_params[pupil] = {
-            'forward_model': fwd_models[pupil],
-            'dx': torch.tensor(image_config[pupil]['dx'], dtype=torch.float32, requires_grad=True, device=device),
-            'dy': torch.tensor(image_config[pupil]['dy'], dtype=torch.float32, requires_grad=True, device=device),
-        }
-
-    # Learning rate settings
-    default_lr = fitting_config['default']['lr']
-    overrides = fitting_config['override']
+    # Build param groups only for those with fit=True
     param_groups = []
-    named_params = collect_named_trainable_params(
-        velocity_params=velocity_params,
-        dispersion_params_R=dispersion_params['R'],
-        dispersion_params_C=dispersion_params['C'],
-    )
-
-    for name, p in named_params.items():
-        if name in overrides and 'lr' in overrides[name]:
-            param_groups.append({'params': [p], 'lr': overrides[name]['lr']})
-        else:
-            param_groups.append({'params': [p], 'lr': default_lr})
+    for cfg in list(velocity_cfg.values()) + list(dispersion_cfgs['R'].values()) + list(dispersion_cfgs['C'].values()):
+        if cfg.fit:
+            param_groups.append({'params': [cfg.tensor], 'lr': cfg.lr})
 
     return {
         'true_grism_R': true_grism_R,
@@ -130,7 +173,7 @@ def load_config_and_initialize(config_path, coadd_R, coadd_C, device=None):
         'fitting_config': fitting_config,
     }
 
-    
+
 #%% --------------------------------------------------------------------------
 # basic abstract class as interface
 # ----------------------------------------------------------------------------
@@ -157,7 +200,7 @@ class BaseFitter(ABC):
 
 class KinematicsFitter(BaseFitter):
 
-    def __init__(self, coadd_R, coadd_C, config: AnyStr, device=None):
+    def __init__(self, coadd_R, coadd_C, config: Any, device=None):
         config_dict = load_config_and_initialize(config, coadd_R, coadd_C, device)
 
         # ─────────────────────────────
