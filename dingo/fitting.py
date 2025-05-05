@@ -75,7 +75,14 @@ def collect_named_trainable_params(**kwargs):
 
     return named_params
 
-def build_param_config_dict(param_dict, default_cfg, overrides, prefix, device=None):
+def parse_alias_expression(val):
+    if isinstance(val, str) and '.' in val:
+        prefix, name = val.rsplit('.', 1)
+        return prefix, name
+    return None
+
+
+def build_param_config_dict_with_alias(param_dict, default_cfg, overrides, prefix, device=None, shared_tensors=None):
     tensor_map = {}
     config_map = {}
 
@@ -87,10 +94,30 @@ def build_param_config_dict(param_dict, default_cfg, overrides, prefix, device=N
 
     for name, value in param_dict.items():
         full_key = f'{prefix}.{name}'
+
         if name not in allowed_keys.get(prefix, set()):
             tensor_map[name] = value  # Keep non-numerical entries as-is
             continue
 
+        # Check if this value is an alias string like 'image.C.dx'
+        alias = parse_alias_expression(value)
+        if alias:
+            alias_prefix, alias_name = alias
+            alias_key = f'{alias_prefix}.{alias_name}'
+            if shared_tensors is not None and alias_key in shared_tensors:
+                shared_tensor = shared_tensors[alias_key]
+                tensor_map[name] = shared_tensor
+                config = FitParamConfig(
+                    name=full_key, value=value, lr=default_cfg['lr'],
+                    vmin=default_cfg['vmin'], vmax=default_cfg['vmax'], fit=True
+                )
+                config.tensor = shared_tensor
+                config_map[full_key] = config
+                continue
+            else:
+                raise ValueError(f"Alias target '{alias_key}' not found for {full_key}")
+
+        # Otherwise, create new tensor
         override_cfg = overrides.get(full_key, {})
         param_cfg = FitParamConfig(
             name=full_key,
@@ -101,12 +128,16 @@ def build_param_config_dict(param_dict, default_cfg, overrides, prefix, device=N
             fit=override_cfg.get('fit', default_cfg['fit'])
         )
 
-        tensor = param_cfg.to_tensor(device=device)  # Only call to_tensor once
-        config_map[full_key] = param_cfg
-        tensor_map[name] = tensor
-        param_cfg.tensor = tensor  # Bind it back to config for param_groups
+        tensor = param_cfg.to_tensor(device=device)
+        param_cfg.tensor = tensor
 
-    return tensor_map, config_map
+        tensor_map[name] = tensor
+        config_map[full_key] = param_cfg
+
+        if shared_tensors is not None:
+            shared_tensors[full_key] = tensor  # Register for alias reference
+
+    return tensor_map, config_map, shared_tensors
 
 def load_fits_data(path_hdu):
     path, hdu_index = path_hdu
@@ -147,8 +178,9 @@ def load_config_and_initialize(config_path, device=None):
         )
 
     # Velocity parameters
-    velocity_params, velocity_cfg = build_param_config_dict(
-        velocity_config_raw, default_cfg, overrides, prefix='velocity', device=device
+    shared_tensors = {}
+    velocity_params, velocity_cfg, shared_tensors = build_param_config_dict_with_alias(
+        velocity_config_raw, default_cfg, overrides, prefix='velocity', device=device, shared_tensors=shared_tensors
     )
 
     # Dispersion parameters
@@ -156,8 +188,8 @@ def load_config_and_initialize(config_path, device=None):
     dispersion_cfgs = {}
     for pupil in ['R', 'C']:
         param_dict = {k: image_config[pupil][k] for k in ['dx', 'dy'] if k in image_config[pupil]}
-        disp_params, disp_cfg = build_param_config_dict(
-            param_dict, default_cfg, overrides, prefix=f'image.{pupil}', device=device
+        disp_params, disp_cfg, shared_tensors = build_param_config_dict_with_alias(
+            param_dict, default_cfg, overrides, prefix=f'image.{pupil}', device=device, shared_tensors=shared_tensors
         )
         disp_params['forward_model'] = fwd_models[pupil]
         dispersion_params[pupil] = disp_params
@@ -174,13 +206,27 @@ def load_config_and_initialize(config_path, device=None):
     cutout_C = (int(cx_C)-r_fit, int(cy_C)-r_fit, 2*r_fit+1, 2*r_fit+1)
 
     # Build param groups only for those with fit=True
+    named_params = collect_named_trainable_params(
+        velocity_params=velocity_params,
+        dispersion_params_R=dispersion_params['R'],
+        dispersion_params_C=dispersion_params['C'],
+    )
+
     param_groups = []
     clamp_list = []
-    for cfg in list(velocity_cfg.values()) + list(dispersion_cfgs['R'].values()) + list(dispersion_cfgs['C'].values()):
-        if cfg.fit:
-            tensor = cfg.tensor
-            param_groups.append({'params': [tensor], 'lr': cfg.lr})
-            clamp_list.append((tensor, cfg.vmin, cfg.vmax))
+
+    for name, tensor in named_params.items():
+        # Find config that matches this tensor
+        all_cfgs = list(velocity_cfg.values()) + \
+                   list(dispersion_cfgs['R'].values()) + \
+                   list(dispersion_cfgs['C'].values())
+        
+        # Find corresponding FitParamConfig
+        cfg = next((c for c in all_cfgs if hasattr(c, 'tensor') and c.tensor is tensor), None)
+        if cfg is None:
+            continue  # not a fit-param
+        param_groups.append({'params': [tensor], 'lr': cfg.lr})
+        clamp_list.append((tensor, cfg.vmin, cfg.vmax))
 
     return {
         'true_grism_R': true_grism_R,
