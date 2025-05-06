@@ -11,24 +11,21 @@ def asinhstretch(im):
 
 def plot_grism_result_2(true_im, model_im, vz, diff_im, title_prefix, axs_row, 
                         velocity_params, dispersion_params):
-    dx = dispersion_params['dx'].detach().cpu().numpy()
-    dy = dispersion_params['dy'].detach().cpu().numpy()
-    x0_v = velocity_params['x0_v'].detach().cpu().numpy()
-    y0_v = velocity_params['y0_v'].detach().cpu().numpy()
-    true = true_im.detach().cpu().numpy()
-    model = model_im.detach().cpu().numpy()
-    residual = model - diff_im.detach().cpu().numpy()
-    vz = vz.detach().cpu().numpy()
+    dx = dispersion_params['dx']
+    dy = dispersion_params['dy']
+    x0_v = velocity_params['x0_v']
+    y0_v = velocity_params['y0_v']
+    residual = model_im - diff_im
     resid_max = np.max(np.abs(residual))
     vz_max = np.max(np.abs(vz))
 
-    im0 = axs_row[0].imshow(true)
+    im0 = axs_row[0].imshow(true_im)
     axs_row[0].set_title(f'{title_prefix} Grism Image')
     axs_row[0].grid(False)
     axs_row[0].scatter(x0_v-dx, y0_v-dy, marker='o', s=100, c='none', edgecolor='lime')
     plt.colorbar(im0, ax=axs_row[0], fraction=0.046, pad=0.04)
 
-    im1 = axs_row[1].imshow(model)
+    im1 = axs_row[1].imshow(model_im)
     axs_row[1].set_title(f'{title_prefix} velocity corrected')
     axs_row[1].grid(False)
     axs_row[1].scatter(x0_v, y0_v, marker='o', s=100, c='none', edgecolor='lime')

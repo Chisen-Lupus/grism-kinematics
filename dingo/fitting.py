@@ -235,7 +235,7 @@ class KinematicsFitter(BaseFitter):
             loss = self.loss()
 
             if i == 0 or (i + 1) % 500 == 0:
-                LOG.info(f'Step {i+1}, loss={loss.item():.3f}, lr={self.optimizer.param_groups[0]["lr"]:.5f}')
+                LOG.info(f'Step {i+1}, loss={loss.item():.3f}, lr={self.optimizer.param_groups[0]["lr"]:.5f}, maxiters finding xy={(self.iter_R, self.iter_C)}')
 
             loss.backward()
             self.optimizer.step()
@@ -247,21 +247,41 @@ class KinematicsFitter(BaseFitter):
             for p, vmin, vmax in self.clamp_list:
                 p.data.clamp_(min=vmin, max=vmax)
 
+        # update FitParamConfig value=
+        for cfg in all_cfg.values():
+            # exclude parameters like forward_model
+            if hasattr(cfg, 'tensor') and isinstance(cfg.tensor, torch.Tensor):
+                if cfg.tensor.ndim == 0:
+                    cfg.value = cfg.tensor.item()
+
+
         return self.losses, self.lrs
 
     # getters and setters ----------------------------------------------------
 
     def get_fitting_results(self): 
-        return self.image_R, self.image_C, self.vz_R, self.vz_C
+        return (
+            self.image_R.detach().cpu().numpy(),  # fitted image for grism R
+            self.image_C.detach().cpu().numpy(),  # fitted image for grism C
+            self.vz_R.detach().cpu().numpy(),     # line-of-sight velocity map for R
+            self.vz_C.detach().cpu().numpy()      # line-of-sight velocity map for C
+        )
+
 
     def get_losses_and_lrs(self): 
         return self.losses, self.lrs
 
     def get_params(self): 
-        return self.velocity_cfg, self.dispersion_cfg_R, self.dispersion_cfg_C
+        velocity = {k.split('.')[-1]: v.value for k, v in self.velocity_cfg.items() if v.tensor is not None}
+        disp_R = {k.split('.')[-1]: v.value for k, v in self.dispersion_cfg_R.items() if v.tensor is not None}
+        disp_C = {k.split('.')[-1]: v.value for k, v in self.dispersion_cfg_C.items() if v.tensor is not None}
+        return velocity, disp_R, disp_C
 
     def get_true_images(self): 
-        return self.true_grism_R, self.true_grism_C
+        return (
+            self.true_grism_R.detach().cpu().numpy(),  # true (input) image from grism R
+            self.true_grism_C.detach().cpu().numpy()   # true (input) image from grism C
+        )
 
     def save_checkpoint(self, path):
         torch.save({
