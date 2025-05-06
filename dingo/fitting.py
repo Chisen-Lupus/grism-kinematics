@@ -122,6 +122,9 @@ class BaseFitter(ABC):
 class KinematicsFitter(BaseFitter):
 
     def __init__(self, config_path, device=None):
+        # ─────────────────────────────
+        # Load configuration
+        # ─────────────────────────────
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
 
@@ -129,6 +132,9 @@ class KinematicsFitter(BaseFitter):
         self.config_path = config_path
         self.config = config
 
+        # ─────────────────────────────
+        # Summary / Metadata
+        # ─────────────────────────────
         summary = config['summary']
         self.name = summary['name']
         self.ra = summary['ra']
@@ -138,12 +144,18 @@ class KinematicsFitter(BaseFitter):
         self.mode = summary['mode']
         self.r_fit = summary['r_fit']
 
+        # ─────────────────────────────
+        # Image loading and wavelength
+        # ─────────────────────────────
         image_config = config['image']
         self.lambda_rest = torch.tensor([summary['lambda_rest']]) * (1 + self.z)
 
         self.true_grism_R = torch.tensor(load_fits_data(image_config['R']['path']), device=device)
         self.true_grism_C = torch.tensor(load_fits_data(image_config['C']['path']), device=device)
 
+        # ─────────────────────────────
+        # Forward model loading
+        # ─────────────────────────────
         self.fwd_models = {}
         for pupil in ['R', 'C']:
             _, spatial_model, disp_model = grism.load_nircam_wfss_model(
@@ -151,49 +163,64 @@ class KinematicsFitter(BaseFitter):
             self.fwd_models[pupil] = utils.get_grism_model_torch(
                 spatial_model, disp_model, pupil, 1024, 1024, direction='forward')
 
+        # ─────────────────────────────
+        # Parameter configuration dictionaries
+        # ─────────────────────────────
         self.velocity_cfg = build_param_config_dict_with_alias(
             config['velocity'], config['fitting'][0]['default'], config['fitting'][0]['override'], prefix='velocity')
 
         self.dispersion_cfg_R = build_param_config_dict_with_alias(
             {k: v for k, v in image_config['R'].items() if k in ['dx', 'dy']},
             config['fitting'][0]['default'], config['fitting'][0]['override'], prefix='image.R')
-        self.dispersion_cfg_R['image.R.forward_model'] = FitParamConfig(name='image.R.forward_model', value=None, lr=0, vmin=0, vmax=0, fit=False)
+        self.dispersion_cfg_R['image.R.forward_model'] = FitParamConfig(
+            name='image.R.forward_model', value=None, lr=0, vmin=0, vmax=0, fit=False)
         self.dispersion_cfg_R['image.R.forward_model'].tensor = self.fwd_models['R']
 
         self.dispersion_cfg_C = build_param_config_dict_with_alias(
             {k: v for k, v in image_config['C'].items() if k in ['dx', 'dy']},
             config['fitting'][0]['default'], config['fitting'][0]['override'], prefix='image.C')
-        self.dispersion_cfg_C['image.C.forward_model'] = FitParamConfig(name='image.C.forward_model', value=None, lr=0, vmin=0, vmax=0, fit=False)
+        self.dispersion_cfg_C['image.C.forward_model'] = FitParamConfig(
+            name='image.C.forward_model', value=None, lr=0, vmin=0, vmax=0, fit=False)
         self.dispersion_cfg_C['image.C.forward_model'].tensor = self.fwd_models['C']
 
+        # ─────────────────────────────
+        # Pixel grid and cutout regions
+        # ─────────────────────────────
         nx_G, ny_G = self.true_grism_R.shape
         self.y_G, self.x_G = torch.meshgrid(torch.arange(nx_G), torch.arange(ny_G), indexing='ij')
 
         cx_R, cy_R = self.fwd_models['R'](torch.tensor(self.r_fit), torch.tensor(self.r_fit), self.lambda_rest)
         cx_C, cy_C = self.fwd_models['C'](torch.tensor(self.r_fit), torch.tensor(self.r_fit), self.lambda_rest)
-        self.cutout_R = (int(cx_R)-self.r_fit, int(cy_R)-self.r_fit, 2*self.r_fit+1, 2*self.r_fit+1)
-        self.cutout_C = (int(cx_C)-self.r_fit, int(cy_C)-self.r_fit, 2*self.r_fit+1, 2*self.r_fit+1)
+        self.cutout_R = (int(cx_R) - self.r_fit, int(cy_R) - self.r_fit, 2*self.r_fit + 1, 2*self.r_fit + 1)
+        self.cutout_C = (int(cx_C) - self.r_fit, int(cy_C) - self.r_fit, 2*self.r_fit + 1, 2*self.r_fit + 1)
 
+        # ─────────────────────────────
+        # Fitting state (lazy init)
+        # ─────────────────────────────
         self.optimizer = None
         self.scheduler = None
         self.clamp_list = None
         self.maxiter = config['fitting'][0]['maxiter']
 
+        # ─────────────────────────────
+        # Fitting outputs and temporary state
+        # ─────────────────────────────
         self.image_R = None
         self.image_C = None
         self.vz_R = None
         self.vz_C = None
-
         self.iter_R = None
         self.iter_C = None
 
     # loss functions  --------------------------------------------------------
 
     def loss(self):
+        # Unpack current tensor values
         velocity = {k.split('.')[-1]: v.tensor for k, v in self.velocity_cfg.items()}
         disp_R = {k.split('.')[-1]: v.tensor for k, v in self.dispersion_cfg_R.items()}
         disp_C = {k.split('.')[-1]: v.tensor for k, v in self.dispersion_cfg_C.items()}
 
+        # Compute forward models and velocities
         self.x_R, self.y_R, self.vz_R, self.iter_R = kinematics.iteratively_find_xy(
             self.x_R, self.y_R, self.cutout_R, self.lambda_rest, self.x_G, self.y_G,
             **velocity, **disp_R)
@@ -206,19 +233,23 @@ class KinematicsFitter(BaseFitter):
         self.image_C = kinematics.bilinear_interpolte_intensity_torch(
             self.x_C, self.y_C, self.true_grism_C, self.cutout_C)
 
+        # Compute L2 loss between R and C images
         return torch.sum((self.image_R - self.image_C)**2)
 
     # fitting loops  ---------------------------------------------------------
 
     def fit_gradient(self):
+        # Reset XY grids before fitting
         self.x_R, self.y_R = self.x_G.clone(), self.y_G.clone()
         self.x_C, self.y_C = self.x_G.clone(), self.y_G.clone()
 
+        # Extract tensors and build optimizer groups
         all_cfg = {**self.velocity_cfg, **self.dispersion_cfg_R, **self.dispersion_cfg_C}
         param_groups, clamp_list = _extract_tensors(all_cfg)
         self.optimizer = torch.optim.Adam(param_groups)
         self.clamp_list = clamp_list
 
+        # Configure learning rate scheduler
         scheduler_type = self.config['fitting'][0]['scheduler']
         if scheduler_type == 'ReduceLROnPlateau':
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -227,6 +258,7 @@ class KinematicsFitter(BaseFitter):
             self.scheduler = torch.optim.lr_scheduler.StepLR(
                 self.optimizer, step_size=2000, gamma=0.1)
 
+        # Optimization loop
         self.losses = []
         self.lrs = []
 
@@ -241,19 +273,22 @@ class KinematicsFitter(BaseFitter):
             self.optimizer.step()
             if self.scheduler:
                 self.scheduler.step(loss)
+
             self.losses.append(loss.item())
             self.lrs.append(self.optimizer.param_groups[0]['lr'])
+
+
+            # Apply value clamping (vmin/vmax)
 
             for p, vmin, vmax in self.clamp_list:
                 p.data.clamp_(min=vmin, max=vmax)
 
-        # update FitParamConfig value=
+        # Update FitParamConfig.value to latest tensor values
         for cfg in all_cfg.values():
-            # exclude parameters like forward_model
+            # exclude entries like forward_model that aren't tensors
             if hasattr(cfg, 'tensor') and isinstance(cfg.tensor, torch.Tensor):
                 if cfg.tensor.ndim == 0:
                     cfg.value = cfg.tensor.item()
-
 
         return self.losses, self.lrs
 
@@ -266,7 +301,6 @@ class KinematicsFitter(BaseFitter):
             self.vz_R.detach().cpu().numpy(),     # line-of-sight velocity map for R
             self.vz_C.detach().cpu().numpy()      # line-of-sight velocity map for C
         )
-
 
     def get_losses_and_lrs(self): 
         return self.losses, self.lrs
