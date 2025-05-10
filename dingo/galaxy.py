@@ -144,7 +144,7 @@ def sersic_model_torch(x, y, I_e, R_e, n, x0, y0, q, theta, **kwargs):
     return model
 
 
-def full_image_model_torch(x, y, psf, add_psf=False, x_psf=None, y_psf=None, I_psf=None, **kwargs):
+def full_sersic_model_torch(x, y, psf, **kwargs):
     """
     Generate a full model image using centered FFT-based convolution.
 
@@ -170,9 +170,11 @@ def full_image_model_torch(x, y, psf, add_psf=False, x_psf=None, y_psf=None, I_p
 
     image_conv = utils.fftconvolve_torch(model, psf, mode='same')
 
-    if add_psf: 
-        nx, ny = x.shape
-        frame = utils.insert_shifted_psf_into_frame(psf, x0=x_psf, y0=y_psf, nx=nx, ny=ny)
-        image_conv = image_conv + frame*I_psf
+    return image_conv
+
+def full_psf_model_torch(nx, ny, psf, x_psf, y_psf, I_psf):
+
+    frame = utils.insert_shifted_psf_into_frame(psf, x0=x_psf, y0=y_psf, nx=nx, ny=ny)
+    image_conv = frame*I_psf
 
     return image_conv
