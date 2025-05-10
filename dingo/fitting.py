@@ -46,7 +46,6 @@ class FitParamConfig:
 
     def __str__(self):
         return self.__repr__()
-
 def build_param_config_dict_with_alias(
     raw_dict: Dict[str, Any],
     default_cfgs: Any,
@@ -60,17 +59,32 @@ def build_param_config_dict_with_alias(
     overrides_list: list of override dicts for each stage.
     prefix: key prefix (e.g., 'velocity', 'image.R').
     """
-    # ensure inputs are lists
+
+    # --- ensure inputs are lists ----------------------------------------------
     if not isinstance(default_cfgs, list):
         default_cfgs = [default_cfgs]
     if not isinstance(overrides_list, list):
         overrides_list = [overrides_list]
 
+    # --- EXPAND grouped override keys -----------------------------------------
+    # allow keys like "image.R.dx, image.R.dy, image.C.dx" → apply same settings
+    expanded_overrides = []
+    for ov in overrides_list:
+        exp = {}
+        for key, settings in ov.items():
+            # split on commas, strip whitespace, re-assign
+            for sub in [k.strip() for k in key.split(',')]:
+                exp[sub] = settings
+        expanded_overrides.append(exp)
+    overrides_list = expanded_overrides
+
+    # --- allowed keys & build configs -----------------------------------------
     allowed_keys = {
         'velocity': {'V_rot', 'R_v', 'x0_v', 'y0_v', 'theta_v', 'inc_v'},
         'image.R': {'dx', 'dy'},
         'image.C': {'dx', 'dy'}
     }
+
     cfgs_list = []
     for default_cfg, overrides in zip(default_cfgs, overrides_list):
         cfgs = {}
@@ -82,7 +96,7 @@ def build_param_config_dict_with_alias(
             if isinstance(val, str):
                 alias_map[full_key] = val
             else:
-                oc = overrides.get(full_key, {})
+                oc = overrides.get(full_key, {})  # now catches any split keys
                 cfgs[full_key] = FitParamConfig(
                     name=full_key,
                     value=val,
@@ -91,13 +105,14 @@ def build_param_config_dict_with_alias(
                     vmax=oc.get('vmax', default_cfg['vmax']),
                     fit=oc.get('fit', default_cfg['fit'])
                 )
-        # apply aliases
+        # apply any string aliases
         for key, alias in alias_map.items():
             if alias in cfgs:
                 cfgs[key] = cfgs[alias]
             else:
                 raise ValueError(f"Alias {alias} not found for {key}")
         cfgs_list.append(cfgs)
+
     return cfgs_list
 
 def _extract_tensors(cfgs: Dict[str, FitParamConfig]):
@@ -251,6 +266,8 @@ class BaseFitter(ABC):
             self.scheduler = torch.optim.lr_scheduler.StepLR(
                 self.optimizer, step_size=2000, gamma=0.1
             )
+        else: 
+            LOG.warning(f'{sched_type} is not a currently supported scheduler!')
 
         self.losses = []
         self.lrs    = []
@@ -327,9 +344,6 @@ class BaseFitter(ABC):
 
     def get_losses_and_lrs(self):
         return self.losses, self.lrs
-
-    def set_maxiter(self, new_maxiter: int):
-        self.maxiter = new_maxiter
 
 #%% --------------------------------------------------------------------------
 # Kinematics fitting subclass
