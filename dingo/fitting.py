@@ -57,13 +57,13 @@ def build_param_config_dict_with_alias(
     prefix: str, 
     all_cfgs: dict = None
 ) -> list:
-    """
+    '''
     Build a list of parameter configuration dictionaries for each fitting strategy.
     raw_dict: parameter values from config.
     default_cfgs: list of default cfg dicts for each stage.
     overrides_list: list of override dicts for each stage.
     prefix: key prefix (e.g., 'velocity', 'image.R').
-    """
+    '''
 
     if all_cfgs is None:
         all_cfgs = [{}]*len(default_cfgs)  # Create a fresh dict if not provided
@@ -75,7 +75,7 @@ def build_param_config_dict_with_alias(
         overrides_list = [overrides_list]
 
     # --- EXPAND grouped override keys -----------------------------------------
-    # allow keys like "image.R.dx, image.R.dy, image.C.dx" → apply same settings
+    # allow keys like 'image.R.dx, image.R.dy, image.C.dx' → apply same settings
     expanded_overrides = []
     for ov in overrides_list:
         exp = {}
@@ -122,7 +122,7 @@ def build_param_config_dict_with_alias(
             if alias in all_cfg:
                 cfgs[key] = all_cfg[alias]
             else:
-                raise ValueError(f"Alias {alias} not found for {key}")
+                raise ValueError(f'Alias {alias} not found for {key}')
         cfgs_list.append(cfgs)
 
     return cfgs_list
@@ -151,6 +151,7 @@ def load_fits_data(path_hdu):
 #%% --------------------------------------------------------------------------
 # generic base class for all fitters
 # ----------------------------------------------------------------------------
+
 class BaseFitter(ABC):
 
     def __init__(self, config_path: AnyStr, device=None):
@@ -161,6 +162,8 @@ class BaseFitter(ABC):
             config = yaml.safe_load(f)
         self.config_path = config_path
         self.config = config
+        if not device: 
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.device = device
 
         # ─────────────────────────────
@@ -191,8 +194,8 @@ class BaseFitter(ABC):
         # setup completeness check
         if not self.param_config_lists:
             LOG.warning(
-                f"[{self.__class__.__name__}] ⚠️ `param_config_lists` is empty. "
-                "You should assign parameter config lists in `_setup_data()` or subclass `__init__`."
+                f'[{self.__class__.__name__}] ⚠️ `param_config_lists` is empty. '
+                'You should assign parameter config lists in `_setup_data()` or subclass `__init__`.'
             )
 
         # ─────────────────────────────
@@ -200,29 +203,22 @@ class BaseFitter(ABC):
         # ─────────────────────────────
         self._assign_cfgs_for_stage(0)
 
-        # ─────────────────────────────
-        # fitting state (lazy init)
-        # ─────────────────────────────
-        self.optimizer  = None
-        self.scheduler  = None
-        self.clamp_list = None
-
     @abstractmethod
     def _setup_data(self):
-        """
+        '''
         Subclasses must:
           - load any image data into attributes
           - load forward models if needed
           - build self.param_config_lists, a dict mapping names
             to lists of cfg-dicts (one per fitting stage)
-        """
+        '''
         pass
 
     def _assign_cfgs_for_stage(self, stage: int):
-        """
+        '''
         Shortcut attributes for the current stage's config dicts.
         E.g. self.velocity_cfg = self.param_config_lists['velocity'][stage]
-        """
+        '''
         for name, cfg_list in self.param_config_lists.items():
             setattr(self, f'{name}_cfg', cfg_list[stage])
 
@@ -235,40 +231,40 @@ class BaseFitter(ABC):
         return params
 
     def _reset_state(self):
-        """
+        '''
         Subclasses may override to reset any per-stage state
         (e.g. starting positions) before each fit_gradient run.
         By default, do nothing.
-        """
+        '''
         pass
 
     @abstractmethod
     def loss(self):
-        """
+        '''
         Compute and return a scalar loss Tensor.
         Subclasses implement, using self.*_cfg and any loaded data.
-        """
+        '''
         pass
 
     def _log(self, i: int, loss: torch.Tensor):
-        """
+        '''
         Default logging hook: logs stage, step, loss, and lr.
         Subclasses can override to include extra info (e.g. xy_iters).
-        """
+        '''
         if i == 0 or (i+1) % 500 == 0:
             LOG.info(
-                f"Stage {self.current_stage+1}, "
-                f"Step {i+1}, loss={loss.item():.3f}, "
-                f"lr={self.optimizer.param_groups[0]['lr']:.5f}"
+                f'Stage {self.current_stage+1}, '
+                f'Step {i+1}, loss={loss.item():.3f}, '
+                f'lr={self.optimizer.param_groups[0]['lr']:.5f}'
             )
 
     def fit_gradient(self):
-        """
+        '''
         Generic gradient-based fitting loop, using:
           - self.loss() for loss computation
           - self.param_config_lists for parameter groups
           - schedulers as specified in config['fitting'][stage]['scheduler']
-        """
+        '''
         fs = self.config['fitting'][self.current_stage]
         self.maxiter = fs['maxiter']
 
@@ -299,28 +295,33 @@ class BaseFitter(ABC):
         self.losses = []
         self.lrs    = []
 
-        for i in range(self.maxiter):
-            self.optimizer.zero_grad()
-            loss = self.loss()
+        try: 
 
-            # logging hook
-            self._log(i, loss)
+            for i in range(self.maxiter):
+                self.optimizer.zero_grad()
+                loss = self.loss()
 
-            self.losses.append(loss.item())
-            self.lrs.append(self.optimizer.param_groups[0]['lr'])
+                # logging hook
+                self._log(i, loss)
 
-            # clamp values to their min/max
-            for p, min, max in clamp_list:
-                p.data.clamp_(min=min, max=max)
+                self.losses.append(loss.item())
+                self.lrs.append(self.optimizer.param_groups[0]['lr'])
 
-            loss.backward()
-            self.optimizer.step()
-            # scheduler step
-            if self.scheduler:
-                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    self.scheduler.step(loss.item())
-                else:
-                    self.scheduler.step()
+                # clamp values to their min/max
+                for p, min, max in clamp_list:
+                    p.data.clamp_(min=min, max=max)
+
+                loss.backward()
+                self.optimizer.step()
+                # scheduler step
+                if self.scheduler:
+                    if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        self.scheduler.step(loss.item())
+                    else:
+                        self.scheduler.step()
+                        
+        except KeyboardInterrupt: 
+            LOG.info(f'KeyboadrInterrupt, last step: {i}')
 
         # write back final tensor values
         for cfg in all_cfg.values():
@@ -330,24 +331,24 @@ class BaseFitter(ABC):
         return self.losses, self.lrs
 
     def fit_all(self):
-        """
+        '''
         Run sequential fitting for all configured stages.
         After stage 0, propagate updated values to next-stage cfg
         so that each subsequent fit starts from the last-fitted values.
         Returns:
           all_losses: list of loss histories per stage
           all_lrs:    list of lr histories per stage
-        """
+        '''
         all_losses = []
         all_lrs    = []
 
         nstages = len(self.config['fitting'])
         for idx in range(nstages):
-            LOG.info(f"Starting fitting stage {idx+1}/{nstages}: method={self.config['fitting'][idx]['method']}")
+            LOG.info(f'Starting fitting stage {idx+1}/{nstages}: method={self.config['fitting'][idx]['method']}')
             self.current_stage = idx
 
             if idx > 0:
-                # propagate values from stage idx-1 → idx
+                # propagate values from stage idx-1 -> idx
                 for cfg_list in self.param_config_lists.values():
                     prev_cfg = cfg_list[idx-1]
                     curr_cfg = cfg_list[idx]
@@ -374,6 +375,7 @@ class BaseFitter(ABC):
 #%% --------------------------------------------------------------------------
 # Kinematics fitting subclass
 # ----------------------------------------------------------------------------
+
 class KinematicsFitter(BaseFitter):
 
     def __init__(self, config_path: AnyStr, device=None):
@@ -496,10 +498,10 @@ class KinematicsFitter(BaseFitter):
         # preserve original xy_iters logging
         if i == 0 or (i+1) % 500 == 0:
             LOG.info(
-                f"Stage {self.current_stage+1}, "
-                f"Step {i+1}, loss={loss.item():.3f}, "
-                f"lr={self.optimizer.param_groups[0]['lr']:.5f}, "
-                f"xy_iters={(self.iter_R, self.iter_C)}"
+                f'Stage {self.current_stage+1}, '
+                f'Step {i+1}, loss={loss.item():.3f}, '
+                f'lr={self.optimizer.param_groups[0]['lr']:.5f}, '
+                f'xy_iters={(self.iter_R, self.iter_C)}'
             )
 
     # getters ----------------------------------------------------------------
@@ -524,21 +526,9 @@ class KinematicsFitter(BaseFitter):
             self.true_grism_C.detach().cpu().numpy()
         )
 
-    def save_checkpoint(self, path):
-        raise NotImplementedError()
-
-    def load_checkpoint(self, path):
-        ckpt = torch.load(path)
-        # restore cfgs & optimizer/scheduler state...
-        self.velocity_cfg     = ckpt['velocity_cfg']
-        self.dispersion_R_cfg = ckpt['dispersion_R_cfg']
-        self.dispersion_C_cfg = ckpt['dispersion_C_cfg']
-        self.optimizer.load_state_dict(ckpt['optimizer'])
-        self.scheduler.load_state_dict(ckpt['scheduler'])
-        self.losses = ckpt['losses']
-        self.lrs    = ckpt['lrs']
-
-
+#%% --------------------------------------------------------------------------
+# Image fitting subclass
+# ----------------------------------------------------------------------------
 
 class ImageFitter(BaseFitter):
     def __init__(self, config_path: str, device=None):
@@ -630,10 +620,10 @@ class ImageFitter(BaseFitter):
     # getters ----------------------------------------------------------------
     
     def get_fitting_results(self):
-        """
+        '''
         Reconstruct the final fitted model (sum of PSF + Sérsic components)
         and return it as a NumPy array.
-        """
+        '''
         # start from zero, same shape as your data
         model = torch.zeros_like(self.true_image)
 
@@ -655,11 +645,11 @@ class ImageFitter(BaseFitter):
 
 
     def get_params(self):
-        """
+        '''
         Return two dicts of final parameter values (pure Python floats),
         first for all Sérsic components, then for all PSF components.
         Each is a mapping cid -> { param_name: value, … }.
-        """
+        '''
         sersic = {
             cid: {
                 k.split('.')[-1]: v.value
@@ -678,7 +668,7 @@ class ImageFitter(BaseFitter):
 
 
     def get_true_images(self):
-        """
+        '''
         Return the original (data) image as a NumPy array.
-        """
+        '''
         return self.true_image.detach().cpu().numpy()
