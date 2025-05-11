@@ -6,9 +6,10 @@ from astropy.io import fits
 import numpy as np
 from typing import Dict, Any, Optional, AnyStr
 from abc import ABC, abstractmethod
+from pprint import pprint
 import os
 
-from . import kinematics, utils, grism
+from . import kinematics, utils, grism, galaxy
 
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.INFO)
@@ -24,33 +25,37 @@ if not LOG.handlers:
 #%% --------------------------------------------------------------------------
 # helper classes and functions
 # ----------------------------------------------------------------------------
+
 @dataclass
 class FitParamConfig:
     name: str
     value: float
     lr: float
-    vmin: float
-    vmax: float
+    min: float
+    max: float
     fit: bool
-    alias: Optional[str] = None
     tensor: Optional[torch.Tensor] = None
 
     def __post_init__(self):
-        self.vmin = float(self.vmin)
-        self.vmax = float(self.vmax)
+        self.min = float(self.min)
+        self.max = float(self.max)
 
     def __repr__(self):
-        return (f'FitParamConfig(name={self.name}, value={self.value}, '
-                f'lr={self.lr}, fit={self.fit}, alias={self.alias}, '
-                f'vmin={self.vmin}, vmax={self.vmax})')
+        return (
+            f'FitParamConfig('
+            f'name={self.name!r}, value={self.value}, lr={self.lr}, '
+            f'fit={self.fit}, min={self.min:.2e}, max={self.max:.2e})'
+        )
 
     def __str__(self):
         return self.__repr__()
+    
 def build_param_config_dict_with_alias(
     raw_dict: Dict[str, Any],
     default_cfgs: Any,
     overrides_list: Any,
-    prefix: str
+    prefix: str, 
+    all_cfgs: dict = None
 ) -> list:
     """
     Build a list of parameter configuration dictionaries for each fitting strategy.
@@ -59,6 +64,9 @@ def build_param_config_dict_with_alias(
     overrides_list: list of override dicts for each stage.
     prefix: key prefix (e.g., 'velocity', 'image.R').
     """
+
+    if all_cfgs is None:
+        all_cfgs = [{}]*len(default_cfgs)  # Create a fresh dict if not provided
 
     # --- ensure inputs are lists ----------------------------------------------
     if not isinstance(default_cfgs, list):
@@ -81,17 +89,20 @@ def build_param_config_dict_with_alias(
     # --- allowed keys & build configs -----------------------------------------
     allowed_keys = {
         'velocity': {'V_rot', 'R_v', 'x0_v', 'y0_v', 'theta_v', 'inc_v'},
-        'image.R': {'dx', 'dy'},
-        'image.C': {'dx', 'dy'}
+        'image': {'dx', 'dy'},
+        'sersic': {'I_e', 'R_e', 'n', 'x0', 'y0', 'q', 'theta'}, 
+        'psf': {'I_psf', 'x_psf', 'y_psf'}
     }
 
     cfgs_list = []
-    for default_cfg, overrides in zip(default_cfgs, overrides_list):
+    # process each batch of fitting
+    for default_cfg, overrides, all_cfg in zip(default_cfgs, overrides_list, all_cfgs):
         cfgs = {}
         alias_map = {}
         for name, val in raw_dict.items():
             full_key = f'{prefix}.{name}'
-            if name not in allowed_keys.get(prefix, set()):
+            # NOTE: full_key may be prefix.name or prefix.cid.name. In the latter case prefix.cid is treated as a prefix
+            if name not in allowed_keys.get(prefix.split('.')[0], set()):
                 continue
             if isinstance(val, str):
                 alias_map[full_key] = val
@@ -101,14 +112,15 @@ def build_param_config_dict_with_alias(
                     name=full_key,
                     value=val,
                     lr=oc.get('lr', default_cfg['lr']),
-                    vmin=oc.get('vmin', default_cfg['vmin']),
-                    vmax=oc.get('vmax', default_cfg['vmax']),
+                    min=oc.get('min', default_cfg['min']),
+                    max=oc.get('max', default_cfg['max']),
                     fit=oc.get('fit', default_cfg['fit'])
                 )
         # apply any string aliases
+        all_cfg.update(cfgs) #joint known keys as alias candidates
         for key, alias in alias_map.items():
-            if alias in cfgs:
-                cfgs[key] = cfgs[alias]
+            if alias in all_cfg:
+                cfgs[key] = all_cfg[alias]
             else:
                 raise ValueError(f"Alias {alias} not found for {key}")
         cfgs_list.append(cfgs)
@@ -128,7 +140,7 @@ def _extract_tensors(cfgs: Dict[str, FitParamConfig]):
             continue
         seen.add(id(cfg.tensor))
         tensors.append({'params': [cfg.tensor], 'lr': cfg.lr})
-        clamp_list.append((cfg.tensor, cfg.vmin, cfg.vmax))
+        clamp_list.append((cfg.tensor, cfg.min, cfg.max))
     return tensors, clamp_list
 
 def load_fits_data(path_hdu):
@@ -176,6 +188,13 @@ class BaseFitter(ABC):
         # ─────────────────────────────
         self._setup_data()
 
+        # setup completeness check
+        if not self.param_config_lists:
+            LOG.warning(
+                f"[{self.__class__.__name__}] ⚠️ `param_config_lists` is empty. "
+                "You should assign parameter config lists in `_setup_data()` or subclass `__init__`."
+            )
+
         # ─────────────────────────────
         # Assign stage-0 configs to attributes
         # ─────────────────────────────
@@ -206,6 +225,14 @@ class BaseFitter(ABC):
         """
         for name, cfg_list in self.param_config_lists.items():
             setattr(self, f'{name}_cfg', cfg_list[stage])
+
+    def _get_model_params(self, key): 
+        params = {
+            k.split('.')[-1]:
+            (v.tensor if v.tensor is not None else torch.tensor(v.value, dtype=torch.float32))
+            for k,v in getattr(self, f'{key}_cfg').items()
+        }
+        return params
 
     def _reset_state(self):
         """
@@ -279,22 +306,21 @@ class BaseFitter(ABC):
             # logging hook
             self._log(i, loss)
 
+            self.losses.append(loss.item())
+            self.lrs.append(self.optimizer.param_groups[0]['lr'])
+
+            # clamp values to their min/max
+            for p, min, max in clamp_list:
+                p.data.clamp_(min=min, max=max)
+
             loss.backward()
             self.optimizer.step()
-
             # scheduler step
             if self.scheduler:
                 if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     self.scheduler.step(loss.item())
                 else:
                     self.scheduler.step()
-
-            self.losses.append(loss.item())
-            self.lrs.append(self.optimizer.param_groups[0]['lr'])
-
-            # clamp values to their vmin/vmax
-            for p, vmin, vmax in clamp_list:
-                p.data.clamp_(min=vmin, max=vmax)
 
         # write back final tensor values
         for cfg in all_cfg.values():
@@ -374,7 +400,7 @@ class KinematicsFitter(BaseFitter):
             )
 
         # ─────────────────────────────
-        # Parameter configs for all stages
+        # Parameter configs for ALL stages
         # ─────────────────────────────
         defaults  = [fs['default']  for fs in self.config['fitting']]
         overrides = [fs['override'] for fs in self.config['fitting']]
@@ -392,7 +418,7 @@ class KinematicsFitter(BaseFitter):
         for cfg in self.dispersion_R_cfg_list:
             cfg['image.R.forward_model'] = FitParamConfig(
                 name='image.R.forward_model', value=None,
-                lr=0, vmin=0, vmax=0, fit=False
+                lr=0, min=0, max=0, fit=False
             )
             cfg['image.R.forward_model'].tensor = self.fwd_models['R']
 
@@ -404,7 +430,7 @@ class KinematicsFitter(BaseFitter):
         for cfg in self.dispersion_C_cfg_list:
             cfg['image.C.forward_model'] = FitParamConfig(
                 name='image.C.forward_model', value=None,
-                lr=0, vmin=0, vmax=0, fit=False
+                lr=0, min=0, max=0, fit=False
             )
             cfg['image.C.forward_model'].tensor = self.fwd_models['C']
 
@@ -439,21 +465,9 @@ class KinematicsFitter(BaseFitter):
 
     def loss(self):
         # unpack both fitted and fixed params as tensors
-        velocity = {
-            k.split('.')[-1]:
-            (v.tensor if v.tensor is not None else torch.tensor(v.value, dtype=torch.float32))
-            for k,v in self.velocity_cfg.items()
-        }
-        disp_R = {
-            k.split('.')[-1]:
-            (v.tensor if v.tensor is not None else torch.tensor(v.value, dtype=torch.float32))
-            for k,v in self.dispersion_R_cfg.items()
-        }
-        disp_C = {
-            k.split('.')[-1]:
-            (v.tensor if v.tensor is not None else torch.tensor(v.value, dtype=torch.float32))
-            for k,v in self.dispersion_C_cfg.items()
-        }
+        velocity = self._get_model_params('velocity')
+        disp_R = self._get_model_params('dispersion_R')
+        disp_C = self._get_model_params('dispersion_C')
 
         # compute R‐channel
         self.x_R, self.y_R, self.vz_R, self.iter_R = kinematics.iteratively_find_xy(
@@ -488,6 +502,8 @@ class KinematicsFitter(BaseFitter):
                 f"xy_iters={(self.iter_R, self.iter_C)}"
             )
 
+    # getters ----------------------------------------------------------------
+
     def get_fitting_results(self):
         return (
             self.image_R.detach().cpu().numpy(),
@@ -521,3 +537,148 @@ class KinematicsFitter(BaseFitter):
         self.scheduler.load_state_dict(ckpt['scheduler'])
         self.losses = ckpt['losses']
         self.lrs    = ckpt['lrs']
+
+
+
+class ImageFitter(BaseFitter):
+    def __init__(self, config_path: str, device=None):
+        super().__init__(config_path, device)
+
+    def _setup_data(self):
+
+        # 1) Load data TODO: load other images
+        img_cfg = self.config['atlas']['im1']
+        img_data = load_fits_data(img_cfg['image'])
+        if 'cutout' in img_cfg: 
+            x, y, dx, dy = img_cfg['cutout']
+            img_data = img_data[x:x+dx, y:y+dy]
+        self.true_image = torch.tensor(
+            img_data,
+            dtype=torch.float32,
+            device=self.device
+        )
+        self.psf_tensor = torch.tensor(
+            load_fits_data(img_cfg['psf']),
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        # 2) Grid
+        nx, ny = self.true_image.shape
+        self.yy, self.xx = torch.meshgrid(
+            torch.linspace(0, nx-1, nx, device=self.device),
+            torch.linspace(0, ny-1, ny, device=self.device),
+            indexing='ij'
+        )
+
+        # 3) Defaults & overrides
+        defaults = [fs['default'] for fs in self.config['fitting']]
+        overrides = [fs['override'] for fs in self.config['fitting']]
+
+        # 4) Raw params
+        _all_cfgs = [{} for _ in range(len(self.config['fitting']))]  # temp cfg for matching alias
+        self.sersic_cfgs_lists = {}
+        self.psf_cfgs_lists = {}
+        # add sersic params
+        for cid, raw_dict in self.config['sersic'].items():
+            s_cfgs = build_param_config_dict_with_alias(
+                raw_dict=raw_dict,
+                default_cfgs=defaults,
+                overrides_list=overrides,
+                prefix=f'sersic.{cid}',
+                all_cfgs=_all_cfgs
+            )
+            self.sersic_cfgs_lists[cid] = s_cfgs
+        # add psf params
+        for cid, raw_dict in self.config['psf'].items():
+            p_cfgs = build_param_config_dict_with_alias(
+                raw_dict=raw_dict,
+                default_cfgs=defaults,
+                overrides_list=overrides,
+                prefix=f'psf.{cid}',
+                all_cfgs=_all_cfgs
+            )
+            self.psf_cfgs_lists[cid] = p_cfgs
+
+        # 5) Register
+        self.param_config_lists = self.psf_cfgs_lists | self.sersic_cfgs_lists
+
+    def loss(self):
+
+        # NOTE: self.*_cfg is already generated by _assign_cfgs_for_stage
+
+        model = 0
+
+        psf_cid_list = self.config['psf'].keys()
+        for psf_cid in psf_cid_list: 
+            psf_params = self._get_model_params(psf_cid)
+            psf_model = model + galaxy.full_psf_model_torch(
+                *self.true_image.shape, self.psf_tensor, **psf_params
+            )
+            model += psf_model
+        
+        sersic_cid_list = self.config['sersic'].keys()
+        for sersic_cid in sersic_cid_list: 
+            sersic_params = self._get_model_params(sersic_cid)
+            sersic_model = galaxy.full_sersic_model_torch(
+                self.xx, self.yy, self.psf_tensor, **sersic_params
+            )
+            model += sersic_model
+
+        return torch.sum((model - self.true_image)**2)
+    
+    # getters ----------------------------------------------------------------
+    
+    def get_fitting_results(self):
+        """
+        Reconstruct the final fitted model (sum of PSF + Sérsic components)
+        and return it as a NumPy array.
+        """
+        # start from zero, same shape as your data
+        model = torch.zeros_like(self.true_image)
+
+        # add up PSF components
+        for cid in self.config['psf']:
+            params = self._get_model_params(cid)
+            model += galaxy.full_psf_model_torch(
+                *self.true_image.shape, self.psf_tensor, **params
+            )
+
+        # add up Sérsic components
+        for cid in self.config['sersic']:
+            params = self._get_model_params(cid)
+            model += galaxy.full_sersic_model_torch(
+                self.xx, self.yy, self.psf_tensor, **params
+            )
+
+        return model.detach().cpu().numpy()
+
+
+    def get_params(self):
+        """
+        Return two dicts of final parameter values (pure Python floats),
+        first for all Sérsic components, then for all PSF components.
+        Each is a mapping cid -> { param_name: value, … }.
+        """
+        sersic = {
+            cid: {
+                k.split('.')[-1]: v.value
+                for k, v in cfg_list[self.current_stage].items()
+            }
+            for cid, cfg_list in self.sersic_cfgs_lists.items()
+        }
+        psf = {
+            cid: {
+                k.split('.')[-1]: v.value
+                for k, v in cfg_list[self.current_stage].items()
+            }
+            for cid, cfg_list in self.psf_cfgs_lists.items()
+        }
+        return sersic, psf
+
+
+    def get_true_images(self):
+        """
+        Return the original (data) image as a NumPy array.
+        """
+        return self.true_image.detach().cpu().numpy()
