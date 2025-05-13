@@ -3,11 +3,43 @@
 from astropy.stats import sigma_clipped_stats
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 
+#%% --------------------------------------------------------------------------
+# helper normalization functions
+# ----------------------------------------------------------------------------
+
+class AsinhNorm(Normalize):
+    def __init__(self, std, vmin=None, vmax=None, clip=False):
+        super().__init__(vmin=vmin, vmax=vmax, clip=clip)
+        self.std = std
+
+    def __call__(self, value, clip=None):
+        # forward: map raw data to [0,1] via arcsinh stretch
+        vmin = self.vmin if self.vmin is not None else np.min(value)
+        vmax = self.vmax if self.vmax is not None else np.max(value)
+        y    = np.arcsinh(value/self.std)
+        ymin = np.arcsinh(vmin/self.std)
+        ymax = np.arcsinh(vmax/self.std)
+        return (y - ymin) / (ymax - ymin)
+
+    def inverse(self, value):
+        # inverse: map [0,1] back to raw data
+        vmin = self.vmin
+        vmax = self.vmax
+        ymin = np.arcsinh(vmin/self.std)
+        ymax = np.arcsinh(vmax/self.std)
+        y    = ymin + value*(ymax - ymin)
+        return self.std * np.sinh(y)
 
 def asinhstretch(im):
     _, _, std = sigma_clipped_stats(im)
     return np.arcsinh(im / std)
+
+#%% --------------------------------------------------------------------------
+# plotting utilities
+# ----------------------------------------------------------------------------
+
 
 def plot_grism_result_2(true_im, model_im, vz, diff_im, title_prefix, axs_row, 
                         velocity_params, dispersion_params):
@@ -64,4 +96,40 @@ def plot_loss_and_lr(losses, lrs, steps=None):
 
     fig.tight_layout()
     plt.title('Loss and Learning Rate Evolution')
+    plt.show()
+
+def plot_image_fitting_result(true_image, gal_model, psf_model):
+
+    full_model  = gal_model + psf_model
+    residual    = true_image - full_model
+    psf_removed = true_image - psf_model
+
+    panels = [
+        ('True Image',            true_image),
+        ('Full Model',            full_model),
+        ('Galaxy Model',          gal_model),
+        ('AGN and sersic2 Removed', psf_removed),
+        ('Residual',              residual),
+    ]
+
+    resid_max = np.max(np.abs(residual))
+
+    fig, axs = plt.subplots(1, 5, figsize=(22, 5))
+    for ax, (title, img) in zip(axs, panels):
+        if title == 'Residual':
+            # keep residual linear but symmetric
+            norm = Normalize(vmin=-resid_max, vmax=resid_max)
+            im = ax.imshow(img, cmap='seismic', norm=norm)
+        else:
+            # compute per‐panel σ for asinhstretch
+            _, _, std = sigma_clipped_stats(img)
+            norm = AsinhNorm(std, vmin=np.min(img), vmax=np.max(img))
+            im = ax.imshow(img, norm=norm)
+
+        ax.set_title(title)
+        ax.grid(False)
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        # cbar.set_label('Pixel value')   # now shows true image units
+
+    plt.tight_layout()
     plt.show()
