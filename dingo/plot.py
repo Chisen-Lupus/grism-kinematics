@@ -40,9 +40,9 @@ def asinhstretch(im):
 # plotting utilities
 # ----------------------------------------------------------------------------
 
-
-def plot_grism_result_2(true_im, model_im, vz, diff_im, title_prefix, axs_row, 
-                        velocity_params, dispersion_params):
+def plot_kinematics_fitting_result(true_im, model_im, vz, diff_im, title_prefix, 
+                                   axs_row, velocity_params, dispersion_params):
+    
     dx = dispersion_params['dx']
     dy = dispersion_params['dy']
     x0_v = velocity_params['x0_v']
@@ -74,6 +74,7 @@ def plot_grism_result_2(true_im, model_im, vz, diff_im, title_prefix, axs_row,
     plt.colorbar(im2, ax=axs_row[3], fraction=0.046, pad=0.04)
 
 def plot_loss_and_lr(losses, lrs, steps=None):
+
     if steps is None:
         steps = range(len(losses))
     
@@ -108,7 +109,7 @@ def plot_image_fitting_result(true_image, gal_model, psf_model):
         ('True Image',            true_image),
         ('Full Model',            full_model),
         ('Galaxy Model',          gal_model),
-        ('AGN and sersic2 Removed', psf_removed),
+        ('AGN Removed', psf_removed),
         ('Residual',              residual),
     ]
 
