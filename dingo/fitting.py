@@ -531,6 +531,7 @@ class KinematicsFitter(BaseFitter):
 # ----------------------------------------------------------------------------
 
 class ImageFitter(BaseFitter):
+
     def __init__(self, config_path: str, device=None):
         super().__init__(config_path, device)
 
@@ -619,7 +620,7 @@ class ImageFitter(BaseFitter):
     
     # getters ----------------------------------------------------------------
     
-    def get_fitting_results(self):
+    def get_fitted_model(self):
         '''
         Reconstruct the final fitted model (sum of PSF + Sérsic components)
         and return it as a NumPy array.
@@ -643,7 +644,6 @@ class ImageFitter(BaseFitter):
 
         return model.detach().cpu().numpy()
 
-
     def get_params(self):
         '''
         Return two dicts of final parameter values (pure Python floats),
@@ -666,9 +666,34 @@ class ImageFitter(BaseFitter):
         }
         return sersic, psf
 
-
     def get_true_images(self):
         '''
         Return the original (data) image as a NumPy array.
         '''
         return self.true_image.detach().cpu().numpy()
+
+    def get_fitted_models(self):
+        '''
+        Reconstruct the fitted models (sum of PSF and/or Sérsic components)
+        and return it as a NumPy array.
+        '''
+
+        # add up PSF components
+        psf_models = {}
+        for cid in self.config['psf']:
+            params = self._get_model_params(cid)
+            model = galaxy.full_psf_model_torch(
+                *self.true_image.shape, self.psf_tensor, **params
+            )
+            psf_models[cid] = model.detach().cpu().numpy()
+
+        # add up Sérsic components
+        sersic_models = {}
+        for cid in self.config['sersic']:
+            params = self._get_model_params(cid)
+            model = galaxy.full_sersic_model_torch(
+                self.xx, self.yy, self.psf_tensor, **params
+            )
+            sersic_models[cid] = model.detach().cpu().numpy()
+
+        return sersic_models, psf_models
