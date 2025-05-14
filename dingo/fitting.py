@@ -22,6 +22,13 @@ if not LOG.handlers:
     console_handler.setFormatter(formatter)
     LOG.addHandler(console_handler)
 
+def log_call(func):
+    def wrapper(*args, **kwargs):
+        # print(f'Calling "{func.__name__}"')
+        LOG.info(f'Calling "{func.__name__}"')
+        return func(*args, **kwargs)
+    return wrapper
+
 #%% --------------------------------------------------------------------------
 # helper classes and functions
 # ----------------------------------------------------------------------------
@@ -91,7 +98,8 @@ def build_param_config_dict_with_alias(
         'velocity': {'V_rot', 'R_v', 'x0_v', 'y0_v', 'theta_v', 'inc_v'},
         'image': {'dx', 'dy'},
         'sersic': {'I_e', 'R_e', 'n', 'x0', 'y0', 'q', 'theta'}, 
-        'psf': {'I_psf', 'x_psf', 'y_psf'}
+        'psf': {'I_psf', 'x_psf', 'y_psf'}, 
+        'direct': {'dx', 'dy'} # TODO: change image to grism and alas to direct??
     }
 
     cfgs_list = []
@@ -184,6 +192,33 @@ class BaseFitter(ABC):
         self.current_stage = 0
         # container for subclass-defined param configs
         self.param_config_lists: Dict[str, list] = {}
+        '''
+        NOTE: Flat list of fitting parameters. It should looks like:
+            {'im0': [{'direct.f356w.im0.dx': FitParamConfig(...),
+                      'direct.f356w.im0.dy': FitParamConfig(...)},
+                     {'direct.f356w.im0.dx': FitParamConfig(...),
+                      'direct.f356w.im0.dy': FitParamConfig(...)}],
+             'p0': [{'psf.p0.I_psf': FitParamConfig(...),
+                     'psf.p0.x_psf': FitParamConfig(...),
+                     'psf.p0.y_psf': FitParamConfig(...)},
+                    {'psf.p0.I_psf': FitParamConfig(...),
+                     'psf.p0.x_psf': FitParamConfig(...),
+                     'psf.p0.y_psf': FitParamConfig(...)}],
+             's0': [{'sersic.s0.I_e': FitParamConfig(...),
+                     'sersic.s0.R_e': FitParamConfig(...),
+                     'sersic.s0.n': FitParamConfig(...),
+                     'sersic.s0.q': FitParamConfig(...),
+                     'sersic.s0.theta': FitParamConfig(...),
+                     'sersic.s0.x0': FitParamConfig(...),
+                     'sersic.s0.y0': FitParamConfig(...)},
+                    {'sersic.s0.I_e': FitParamConfig(...),
+                     'sersic.s0.R_e': FitParamConfig(...),
+                     'sersic.s0.n': FitParamConfig(...),
+                     'sersic.s0.q': FitParamConfig(...),
+                     'sersic.s0.theta': FitParamConfig(...),
+                     'sersic.s0.x0': FitParamConfig(...),
+                     'sersic.s0.y0': FitParamConfig(...)}]}
+        '''
 
         # ─────────────────────────────
         # Subclass-specific setup:
@@ -218,6 +253,7 @@ class BaseFitter(ABC):
         '''
         Shortcut attributes for the current stage's config dicts.
         E.g. self.velocity_cfg = self.param_config_lists['velocity'][stage]
+        Example generated attributes: self.im0_cfg, self.s0_cfg, self.p0_cfg
         '''
         for name, cfg_list in self.param_config_lists.items():
             setattr(self, f'{name}_cfg', cfg_list[stage])
@@ -530,35 +566,60 @@ class KinematicsFitter(BaseFitter):
 # Image fitting subclass
 # ----------------------------------------------------------------------------
 
-class ImageFitter(BaseFitter):
+class ImagesFitter(BaseFitter):
 
     def __init__(self, config_path: str, device=None):
         super().__init__(config_path, device)
 
     def _setup_data(self):
 
-        # 1) Load data TODO: load other images
-        img_cfg = self.config['atlas']['im1']
-        img_data = load_fits_data(img_cfg['image'])
-        if 'cutout' in img_cfg: 
-            x, y, dx, dy = img_cfg['cutout']
-            img_data = img_data[x:x+dx, y:y+dy]
-        self.true_image = torch.tensor(
-            img_data,
-            dtype=torch.float32,
-            device=self.device
-        )
-        self.psf_tensor = torch.tensor(
-            load_fits_data(img_cfg['psf']),
-            dtype=torch.float32,
-            device=self.device
-        )
+        # 1) Load psf and direct image data (except dx dy)
+        self.all_filters = set(self.config['direct'].keys())
 
-        # 2) Grid
-        nx, ny = self.true_image.shape
+        # load psf data
+        self.psfs = {} # {pid: {property: value}}
+        for filter, psfs_cfg in self.config['psfs'].items():
+            self.psfs[filter] = {}
+            for pid, psf_cfg in psfs_cfg.items():
+                psf_data = load_fits_data(psf_cfg['path'])
+                psf_tensor = torch.tensor(
+                    psf_data, dtype=torch.float32, device=self.device
+                )
+                psf_info = {}
+                psf_info['psf'] = psf_tensor
+                psf_info['oversample'] = psf_cfg['oversample']
+                psf_info['image_map'] = [] # to be added in the next step
+                self.psfs[filter][pid] = psf_info
+
+        # load image data
+        self.direct_images = {} # {filter: {iid: {property: value}}}
+        for filter, imgs_cfg in self.config['direct'].items():
+            self.direct_images[filter] = {}
+            for iid, img_cfg in imgs_cfg.items():
+                # register psf
+                pid = img_cfg['psf']
+                self.psfs[filter][pid]['image_map'].append(iid)
+                # add image data
+                img_data = load_fits_data(img_cfg['path'])
+                if 'cutout' in img_cfg: 
+                    x, y, dx, dy = img_cfg['cutout']
+                    img_data = img_data[x:x+dx, y:y+dy]
+                img_tensor = torch.tensor(
+                    img_data, dtype=torch.float32, device=self.device
+                )
+                direct_info = {}
+                direct_info['pid'] = pid
+                direct_info['image'] = img_tensor
+                direct_info['oversample'] = img_cfg['oversample']
+                if self.psfs[filter][pid]['oversample']<direct_info['oversample']: 
+                    raise ValueError('PSF is not well-sampled!')
+                self.direct_images[filter][iid] = direct_info
+
+        # 2) Grid # TODO: specify for each filter??
+        self.nx, self.ny = self.r_fit*2+1, self.r_fit*2+1
         self.yy, self.xx = torch.meshgrid(
-            torch.linspace(0, nx-1, nx, device=self.device),
-            torch.linspace(0, ny-1, ny, device=self.device),
+            torch.linspace(0, self.nx-1, self.nx, device=self.device),
+            torch.linspace(0, self.ny-1, self.ny, device=self.device),
             indexing='ij'
         )
 
@@ -568,8 +629,22 @@ class ImageFitter(BaseFitter):
 
         # 4) Raw params
         _all_cfgs = [{} for _ in range(len(self.config['fitting']))]  # temp cfg for matching alias
+        self.direct_cfgs_lists = {}
         self.sersic_cfgs_lists = {}
         self.psf_cfgs_lists = {}
+
+        # add image params
+        for filter, imgs_cfg in self.config['direct'].items():
+            for iid, raw_dict in imgs_cfg.items():
+                i_cfgs = build_param_config_dict_with_alias(
+                    raw_dict=raw_dict,
+                    default_cfgs=defaults,
+                    overrides_list=overrides,
+                    prefix=f'direct.{filter}.{iid}',
+                    all_cfgs=_all_cfgs
+                )
+                self.direct_cfgs_lists[iid] = i_cfgs
+
         # add sersic params
         for cid, raw_dict in self.config['sersic'].items():
             s_cfgs = build_param_config_dict_with_alias(
@@ -580,6 +655,7 @@ class ImageFitter(BaseFitter):
                 all_cfgs=_all_cfgs
             )
             self.sersic_cfgs_lists[cid] = s_cfgs
+
         # add psf params
         for cid, raw_dict in self.config['psf'].items():
             p_cfgs = build_param_config_dict_with_alias(
@@ -592,31 +668,57 @@ class ImageFitter(BaseFitter):
             self.psf_cfgs_lists[cid] = p_cfgs
 
         # 5) Register
-        self.param_config_lists = self.psf_cfgs_lists | self.sersic_cfgs_lists
+        self.param_config_lists = self.psf_cfgs_lists | self.sersic_cfgs_lists | self.direct_cfgs_lists
 
     def loss(self):
 
         # NOTE: self.*_cfg is already generated by _assign_cfgs_for_stage
 
-        model = 0
+        loss = 0
 
-        psf_cid_list = self.config['psf'].keys()
-        for psf_cid in psf_cid_list: 
-            psf_params = self._get_model_params(psf_cid)
-            psf_model = model + galaxy.full_psf_model_torch(
-                *self.true_image.shape, self.psf_tensor, **psf_params
-            )
-            model += psf_model
-        
-        sersic_cid_list = self.config['sersic'].keys()
-        for sersic_cid in sersic_cid_list: 
-            sersic_params = self._get_model_params(sersic_cid)
-            sersic_model = galaxy.full_sersic_model_torch(
-                self.xx, self.yy, self.psf_tensor, **sersic_params
-            )
-            model += sersic_model
+        # construct true image per psf
+        for filter in self.all_filters:
+            for pid, psf_info in self.psfs[filter].items():
+                # print(psf_info)
+                psf_tensor = psf_info['psf']
+                img_list = psf_info['image_map']
 
-        return torch.sum((model - self.true_image)**2)
+                # compute psf-level sampled model at this filter
+
+                model = 0
+
+                psf_cid_list = self.config['psf'].keys()
+                for psf_cid in psf_cid_list: 
+                    psf_params = self._get_model_params(psf_cid)
+                    psf_model = model + galaxy.full_psf_model_torch(
+                        self.nx, self.ny, psf_tensor, **psf_params
+                    )
+                    model += psf_model
+                
+                sersic_cid_list = self.config['sersic'].keys()
+                for sersic_cid in sersic_cid_list: 
+                    sersic_params = self._get_model_params(sersic_cid)
+                    sersic_model = galaxy.full_sersic_model_torch(
+                        self.xx, self.yy, psf_tensor, **sersic_params
+                    )
+                    model += sersic_model
+
+                # downsample to each image and compute loss
+
+                for iid in img_list: 
+                    direct_info = self.direct_images[filter][iid]
+                    this_image = direct_info['image']
+                    factor = psf_info['oversample']//direct_info['oversample']
+                    direct_params = self._get_model_params(iid)
+                    nx, ny = this_image.shape
+                    dx, dy = direct_params.values()
+                    this_model = utils.downsample_with_shift_and_size(
+                        x=model, factor=factor, out_size=(nx, ny), shift=(dx, dy), 
+                    )
+                    this_loss = torch.sum((this_model - this_image)**2)
+                    loss += this_loss
+
+        return loss
     
     # getters ----------------------------------------------------------------
     
@@ -625,6 +727,7 @@ class ImageFitter(BaseFitter):
         Reconstruct the final fitted model (sum of PSF + Sérsic components)
         and return it as a NumPy array.
         '''
+        raise NotImplementedError() # TODO
         # start from zero, same shape as your data
         model = torch.zeros_like(self.true_image)
 
@@ -672,28 +775,60 @@ class ImageFitter(BaseFitter):
         '''
         return self.true_image.detach().cpu().numpy()
 
-    def get_fitted_models(self):
+    def get_fitted_models(self, filter=None, iid=None):
         '''
         Reconstruct the fitted models (sum of PSF and/or Sérsic components)
         and return it as a NumPy array.
+        Parameters
+        ----------
+        filter: str
+            The Filter of the model to be returned. Default to be the first item
+        iid: str
+            The Image ID of the model to be returned. Default to be the first item
         '''
 
-        # add up PSF components
+        if not filter: 
+            filter = next(iter(self.direct_images.keys()))
+        if not iid: 
+            iid = next(iter(self.direct_images[filter].keys()))
+
+        # image-specifig configs
+        
+        direct_info = self.direct_images[filter][iid]
+        pid = direct_info['pid']
+        psf_info = self.psfs[filter][pid]
+        psf_tensor = psf_info['psf']
+        this_image = direct_info['image']
+        factor = psf_info['oversample']//direct_info['oversample']
+        direct_params = self._get_model_params(iid)
+        nx, ny = this_image.shape
+        dx, dy = direct_params.values()
+
+        # compute models and downsample
+
         psf_models = {}
-        for cid in self.config['psf']:
-            params = self._get_model_params(cid)
-            model = galaxy.full_psf_model_torch(
-                *self.true_image.shape, self.psf_tensor, **params
-            )
-            psf_models[cid] = model.detach().cpu().numpy()
-
-        # add up Sérsic components
         sersic_models = {}
-        for cid in self.config['sersic']:
-            params = self._get_model_params(cid)
-            model = galaxy.full_sersic_model_torch(
-                self.xx, self.yy, self.psf_tensor, **params
-            )
-            sersic_models[cid] = model.detach().cpu().numpy()
 
+        psf_cid_list = self.config['psf'].keys()
+        for psf_cid in psf_cid_list: 
+            psf_params = self._get_model_params(psf_cid)
+            psf_model = galaxy.full_psf_model_torch(
+                self.nx, self.ny, psf_tensor, **psf_params
+            )
+            this_component = utils.downsample_with_shift_and_size(
+                x=psf_model, factor=factor, out_size=(nx, ny), shift=(dx, dy), 
+            )
+            psf_models[psf_cid] = this_component.detach().cpu().numpy()
+        
+        sersic_cid_list = self.config['sersic'].keys()
+        for sersic_cid in sersic_cid_list: 
+            sersic_params = self._get_model_params(sersic_cid)
+            sersic_model = galaxy.full_sersic_model_torch(
+                self.xx, self.yy, psf_tensor, **sersic_params
+            )
+            this_component = utils.downsample_with_shift_and_size(
+                x=sersic_model, factor=factor, out_size=(nx, ny), shift=(dx, dy), 
+            )
+            sersic_models[sersic_cid] = this_component.detach().cpu().numpy()
+        
         return sersic_models, psf_models

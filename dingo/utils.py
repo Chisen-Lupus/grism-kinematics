@@ -389,3 +389,81 @@ def insert_shifted_psf_into_frame(psf, x0, y0, nx, ny):
     frame[y_start:y_end, x_start:x_end] = shifted_psf[psf_y_start:psf_y_end, psf_x_start:psf_x_end]
 
     return frame
+
+def downsample_with_shift_and_size(
+    x: torch.Tensor,
+    factor: int,
+    out_size: tuple[int,int],
+    shift: tuple[float,float],
+) -> torch.Tensor:
+    """
+    Downsample a 2D image by integer `factor` with exact block-averaging,
+    into an array of shape out_size=(H_out, W_out), applying a relative
+    shift in *output*‐pixel units.
+
+    Args:
+        x        (H, W)          : single‐channel input image
+        factor   int>1           : downsampling factor f
+        out_size (H_out, W_out)  : desired output shape
+        shift    (sy_out, sx_out): shift *in output pixels* between
+                                  input‐ and output‐centers
+
+    Returns:
+        y       (H_out, W_out)   : downsampled & averaged result
+    """
+    H, W = x.shape
+    f = factor
+    H_out, W_out = out_size
+    sy_out, sx_out = shift
+    device, dtype = x.device, x.dtype
+
+    # 1) build a grouped‐conv kernel of ones to integrate each f×f block
+    x_in = x.unsqueeze(0).unsqueeze(0)  # → (1,1,H,W)
+    kernel = torch.ones(1, 1, f, f, device=device, dtype=dtype)
+    conv = F.conv2d(x_in, kernel, stride=1, padding=0)
+    # conv has shape (1,1,H-f+1, W-f+1)
+    Hc, Wc = conv.shape[2], conv.shape[3]
+
+    # 2) figure out the *starting‐corner* of the block that sits
+    #    at the *center* of the output; then march in steps of f.
+    #    A block starting at (i,j) covers input[i:i+f, j:j+f] and
+    #    its "center" is at i + (f-1)/2.  To have that sit at input
+    #    center (at (H-1)/2), you need i = (H - f)/2.
+    center_i = (H - f) / 2.0
+    center_j = (W - f) / 2.0
+
+    # convert the *output‐pixel* shift into input‐pixel units:
+    sy_in = sy_out * f
+    sx_in = sx_out * f
+
+    # we want H_out blocks, centered, stepping by f:
+    idx_i = torch.arange(H_out, device=device, dtype=dtype) - (H_out - 1)/2.0
+    idx_j = torch.arange(W_out, device=device, dtype=dtype) - (W_out - 1)/2.0
+
+    # absolute block‐start positions in *conv*‐coords:
+    ys = center_i - sy_in + f * idx_i    # shape (H_out,)
+    xs = center_j - sx_in + f * idx_j    # shape (W_out,)
+
+    # 3) normalize to [-1,1] over the conv map
+    ys_norm = ys / (Hc - 1) * 2 - 1       # still shape (H_out,)
+    xs_norm = xs / (Wc - 1) * 2 - 1       # shape (W_out,)
+
+    # 4) build a (1, H_out, W_out, 2) sampling grid
+    grid_y = ys_norm.unsqueeze(1).expand(H_out, W_out)
+    grid_x = xs_norm.unsqueeze(0).expand(H_out, W_out)
+    grid   = torch.stack((grid_x, grid_y), dim=-1)  # (H_out, W_out, 2)
+    grid   = grid.unsqueeze(0)                      # (1, H_out, W_out, 2)
+
+    # 5) bilinearly sample the *integrated* map at those fractional starts
+    sampled = F.grid_sample(
+        conv, grid,
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=True
+    )
+    # → shape (1,1,H_out,W_out)
+
+    # 6) divide by f^2 to turn sums into averages
+    y = sampled / (f*f)   # still (1,1,H_out,W_out)
+
+    return y[0,0]

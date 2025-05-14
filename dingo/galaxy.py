@@ -173,6 +173,7 @@ def full_sersic_model_torch(x, y, psf, **kwargs):
     return image_conv
 
 def full_psf_model_torch(nx, ny, psf, x_psf, y_psf, I_psf):
+    # TODO: if we have a well-sampled psf model we can draw xy values from psf
 
     frame = utils.insert_shifted_psf_into_frame(psf, x0=x_psf, y0=y_psf, nx=nx, ny=ny)
     image_conv = frame*I_psf
