@@ -4,9 +4,20 @@ import numpy as np
 from astropy.modeling.models import Gaussian2D
 from scipy.special import gammaincinv
 from scipy.signal import fftconvolve
-import torchinterp1d
+import logging
 
 from . import grism
+
+LOG = logging.getLogger(__name__)
+LOG.setLevel(logging.INFO)
+if not LOG.handlers:
+    console_handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    console_handler.setFormatter(formatter)
+    LOG.addHandler(console_handler)
 
 #%% utility functions in numpy
 

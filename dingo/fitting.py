@@ -743,7 +743,14 @@ class ImagesFitter(BaseFitter):
             }
             for cid, cfg_list in self.psf_cfgs_lists.items()
         }
-        return sersic, psf
+        direct = {
+            iid: {
+                k.split('.')[-1]: v.value
+                for k, v in cfg_list[self.current_stage].items()
+            }
+            for iid, cfg_list in self.direct_cfgs_lists.items()
+        }
+        return sersic, psf, direct
 
     def get_true_image(self, filter=None, iid=None): 
         '''
@@ -865,3 +872,43 @@ class ImagesFitter(BaseFitter):
                 model = self.get_fitted_model(filter, iid)
                 models[filter][iid] = model
         return models
+    
+    def get_oversampled_fitted_component(self, filter=None, pid=None):
+        # TODO: Code can be fused with above??
+
+        if not filter: 
+            filter = next(iter(self.direct_images.keys()))
+        if not pid: 
+            pid = next(iter(self.psfs[filter].keys()))
+
+        # image-specifig configs
+        
+        psf_info = self.psfs[filter][pid]
+        psf_tensor = psf_info['psf']
+        # compute models and downsample
+
+        psf_models = {}
+        sersic_models = {}
+
+        psf_cid_list = self.config['psf'].keys()
+        for psf_cid in psf_cid_list: 
+            psf_params = self._get_model_params(psf_cid)
+            psf_model = galaxy.full_psf_model_torch(
+                self.nx, self.ny, psf_tensor, **psf_params
+            )
+            psf_models[psf_cid] = psf_model.detach().cpu().numpy()
+        
+        sersic_cid_list = self.config['sersic'].keys()
+        for sersic_cid in sersic_cid_list: 
+            sersic_params = self._get_model_params(sersic_cid)
+            sersic_model = galaxy.full_sersic_model_torch(
+                self.xx, self.yy, psf_tensor, **sersic_params
+            )
+            sersic_models[sersic_cid] = sersic_model.detach().cpu().numpy()
+        
+        return sersic_models, psf_models
+    
+    def get_oversampled_fitted_model(self, filter=None, iid=None):
+        sersic_models, psf_models = self.get_oversampled_fitted_component(filter, iid)
+        model = np.sum(list(sersic_models.values())+list(psf_models.values()), axis=0)
+        return model
