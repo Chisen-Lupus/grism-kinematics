@@ -343,19 +343,20 @@ class BaseFitter(ABC):
                 self.losses.append(loss.item())
                 self.lrs.append(self.optimizer.param_groups[0]['lr'])
 
-                # clamp values to their min/max
-                for p, min, max in clamp_list:
-                    p.data.clamp_(min=min, max=max)
-
                 loss.backward()
                 self.optimizer.step()
+                
                 # scheduler step
                 if self.scheduler:
                     if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                         self.scheduler.step(loss.item())
                     else:
                         self.scheduler.step()
-                        
+
+                # clamp values to their min/max
+                for p, min, max in clamp_list:
+                    p.data.clamp_(min=min, max=max)
+
         except KeyboardInterrupt: 
             LOG.info(f'KeyboadrInterrupt, last step: {i}')
 
@@ -721,31 +722,6 @@ class ImagesFitter(BaseFitter):
         return loss
     
     # getters ----------------------------------------------------------------
-    
-    def get_fitted_model(self):
-        '''
-        Reconstruct the final fitted model (sum of PSF + Sérsic components)
-        and return it as a NumPy array.
-        '''
-        raise NotImplementedError() # TODO
-        # start from zero, same shape as your data
-        model = torch.zeros_like(self.true_image)
-
-        # add up PSF components
-        for cid in self.config['psf']:
-            params = self._get_model_params(cid)
-            model += galaxy.full_psf_model_torch(
-                *self.true_image.shape, self.psf_tensor, **params
-            )
-
-        # add up Sérsic components
-        for cid in self.config['sersic']:
-            params = self._get_model_params(cid)
-            model += galaxy.full_sersic_model_torch(
-                self.xx, self.yy, self.psf_tensor, **params
-            )
-
-        return model.detach().cpu().numpy()
 
     def get_params(self):
         '''
@@ -769,16 +745,35 @@ class ImagesFitter(BaseFitter):
         }
         return sersic, psf
 
-    def get_true_images(self):
+    def get_true_image(self, filter=None, iid=None): 
         '''
         Return the original (data) image as a NumPy array.
         '''
-        return self.true_image.detach().cpu().numpy()
+        if not filter: 
+            filter = next(iter(self.direct_images.keys()))
+        if not iid: 
+            iid = next(iter(self.direct_images[filter].keys()))
+        true_image = self.direct_images[filter][iid]['image']
+        return true_image.detach().cpu().numpy()
 
-    def get_fitted_models(self, filter=None, iid=None):
+    def get_true_images(self):
+        '''
+        Return the original (data) image as a dict of NumPy array.
+        '''
+        true_images = {}
+        for filter in self.all_filters:
+            true_images[filter] = {}
+            for iid in self.direct_images[filter].keys(): 
+                true_image = self.get_true_image(filter, iid) 
+                true_images[filter][iid] = true_image
+
+        return true_images
+
+    def get_fitted_component(self, filter=None, iid=None):
         '''
         Reconstruct the fitted models (sum of PSF and/or Sérsic components)
         and return it as a NumPy array.
+
         Parameters
         ----------
         filter: str
@@ -832,3 +827,41 @@ class ImagesFitter(BaseFitter):
             sersic_models[sersic_cid] = this_component.detach().cpu().numpy()
         
         return sersic_models, psf_models
+
+    def get_fitted_components(self):
+        '''
+        return all the get_fitted_component
+        '''
+        models = {}
+        all_sersic_models = {}
+        all_psf_models = {}
+        for filter in self.all_filters:
+            models[filter] = {}
+            all_psf_models[filter] = {}
+            for iid in self.direct_images[filter].keys(): 
+                sersic_models, psf_models = self.get_fitted_component(filter, iid)
+                all_sersic_models[filter][iid] = sersic_models
+                all_psf_models[filter][iid] = psf_models
+
+        return all_sersic_models, all_psf_models
+
+    def get_fitted_model(self, filter=None, iid=None):
+        '''
+        Reconstruct the final fitted model (sum of PSF + Sérsic components)
+        and return it as a NumPy array.
+        '''
+        sersic_models, psf_models = self.get_fitted_component(filter, iid)
+        model = np.sum(list(sersic_models.values())+list(psf_models.values()), axis=0)
+        return model
+
+    def get_fitted_models(self):
+        '''
+        return all the get_fitted_model
+        '''
+        models = {}
+        for filter in self.all_filters:
+            models[filter] = {}
+            for iid in self.direct_images[filter].keys(): 
+                model = self.get_fitted_model(filter, iid)
+                models[filter][iid] = model
+        return models
