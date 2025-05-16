@@ -203,21 +203,8 @@ class BaseFitter(ABC):
                      'psf.p0.y_psf': FitParamConfig(...)},
                     {'psf.p0.I_psf': FitParamConfig(...),
                      'psf.p0.x_psf': FitParamConfig(...),
-                     'psf.p0.y_psf': FitParamConfig(...)}],
-             's0': [{'sersic.s0.I_e': FitParamConfig(...),
-                     'sersic.s0.R_e': FitParamConfig(...),
-                     'sersic.s0.n': FitParamConfig(...),
-                     'sersic.s0.q': FitParamConfig(...),
-                     'sersic.s0.theta': FitParamConfig(...),
-                     'sersic.s0.x0': FitParamConfig(...),
-                     'sersic.s0.y0': FitParamConfig(...)},
-                    {'sersic.s0.I_e': FitParamConfig(...),
-                     'sersic.s0.R_e': FitParamConfig(...),
-                     'sersic.s0.n': FitParamConfig(...),
-                     'sersic.s0.q': FitParamConfig(...),
-                     'sersic.s0.theta': FitParamConfig(...),
-                     'sersic.s0.x0': FitParamConfig(...),
-                     'sersic.s0.y0': FitParamConfig(...)}]}
+                     'psf.p0.y_psf': FitParamConfig(...)}], 
+             ...}
         '''
 
         # ─────────────────────────────
@@ -312,7 +299,14 @@ class BaseFitter(ABC):
         for cfg_list in self.param_config_lists.values():
             all_cfg.update(cfg_list[self.current_stage])
         param_groups, clamp_list = _extract_tensors(all_cfg)
-        self.optimizer  = torch.optim.Adam(param_groups)
+        # if there’s nothing to fit, warn and bail out
+        if not param_groups:
+            LOG.warning(
+                f'[{self.__class__.__name__}] ⚠️ '
+                f'no trainable parameters in stage {self.current_stage+1}, skipping.'
+            )
+            return [], []
+        self.optimizer = torch.optim.Adam(param_groups)
         self.clamp_list = clamp_list
 
         # scheduler setup
