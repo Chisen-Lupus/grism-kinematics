@@ -129,7 +129,8 @@ def plot_image_fitting_result(true_image, gal_model, psf_model):
 
         ax.set_title(title)
         ax.grid(False)
-        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        if np.max(img)>np.min(img):
+            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         # cbar.set_label('Pixel value')   # now shows true image units
 
     plt.tight_layout()
