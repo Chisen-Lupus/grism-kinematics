@@ -99,7 +99,7 @@ def build_param_config_dict_with_alias(
         'image': {'dx', 'dy'},
         'sersic': {'I_e', 'R_e', 'n', 'x0', 'y0', 'q', 'theta'}, 
         'psf': {'I_psf', 'x_psf', 'y_psf'}, 
-        'direct': {'dx', 'dy'} # TODO: change image to grism and alas to direct??
+        'direct': {'dx', 'dy', 'wt', 'zp'} # TODO: change image to grism and alas to direct??
     }
 
     cfgs_list = []
@@ -269,12 +269,12 @@ class BaseFitter(ABC):
         '''
         pass
 
-    def _log(self, i: int, loss: torch.Tensor):
+    def _log(self, i: int, loss: torch.Tensor, cadence: int=500):
         '''
         Default logging hook: logs stage, step, loss, and lr.
         Subclasses can override to include extra info (e.g. xy_iters).
         '''
-        if i == 0 or (i+1) % 500 == 0:
+        if i == 0 or (i+1) % cadence == 0:
             LOG.info(
                 f'Stage {self.current_stage+1}, '
                 f'Step {i+1}, loss={loss.item():.3f}, '
@@ -327,6 +327,8 @@ class BaseFitter(ABC):
 
         try: 
 
+            last_loss = torch.tensor(0) # placeholder
+
             for i in range(self.maxiter):
                 self.optimizer.zero_grad()
                 loss = self.loss()
@@ -351,8 +353,10 @@ class BaseFitter(ABC):
                 for p, min, max in clamp_list:
                     p.data.clamp_(min=min, max=max)
 
+                last_loss = loss
+
         except KeyboardInterrupt: 
-            LOG.info(f'KeyboadrInterrupt, last step: {i}')
+            LOG.info(f'KeyboadrInterrupt, last step: {i}, last loss: {last_loss}')
 
         # write back final tensor values
         for cfg in all_cfg.values():
@@ -706,10 +710,12 @@ class ImagesFitter(BaseFitter):
                     factor = psf_info['oversample']//direct_info['oversample']
                     direct_params = self._get_model_params(iid)
                     nx, ny = this_image.shape
-                    dx, dy = direct_params.values()
+                    dx, dy, wt, zp = direct_params.values()
                     this_model = utils.downsample_with_shift_and_size(
                         x=model, factor=factor, out_size=(nx, ny), shift=(dx, dy), 
                     )
+                    # this_image = (this_image - zp)*wt
+                    this_image = (this_image - zp)/wt
                     this_loss = torch.sum((this_model - this_image)**2)
                     loss += this_loss
 
@@ -798,7 +804,7 @@ class ImagesFitter(BaseFitter):
         factor = psf_info['oversample']//direct_info['oversample']
         direct_params = self._get_model_params(iid)
         nx, ny = this_image.shape
-        dx, dy = direct_params.values()
+        dx, dy, _, _ = direct_params.values()
 
         # compute models and downsample
 

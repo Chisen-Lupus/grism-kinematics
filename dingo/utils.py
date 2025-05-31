@@ -468,7 +468,7 @@ def downsample_with_shift_and_size(
     # 5) bilinearly sample the *integrated* map at those fractional starts
     sampled = F.grid_sample(
         conv, grid,
-        mode='bilinear',
+        mode='bicubic',
         padding_mode='zeros',
         align_corners=True
     )
