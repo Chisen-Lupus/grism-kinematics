@@ -58,19 +58,20 @@ def combine_image(
     NY_LARGE = NY*NSUB
     NC_FREQ = int(2**np.ceil(np.log2(NX_LARGE))) + 2 # find the next 2^N+2 e.g. 514
     NR_FREQ = int(2**np.ceil(np.log2(NY_LARGE))) # 4x of NX_LARGE can effectlively dissipate the noise
-    NC_FREQ = 130
-    NR_FREQ = 128
+    # NC_FREQ = 130
+    # NR_FREQ = 128
+    DEVICE = normalized_atlas.device
 
 
-    Atotal = torch.zeros((NC_FREQ//2, NR_FREQ), dtype=torch.complex64)
-    F = torch.zeros((NC_FREQ, NR_FREQ), dtype=torch.complex64)
+    Atotal = torch.zeros((NC_FREQ//2, NR_FREQ), dtype=torch.complex64, device=DEVICE)
+    F = torch.zeros((NC_FREQ, NR_FREQ), dtype=torch.complex64, device=DEVICE)
 
     for npos in range(len(normalized_atlas)): 
 
         data = normalized_atlas[npos]
-        data_large = torch.zeros((NC_FREQ, NR_FREQ))
+        data_large = torch.zeros((NC_FREQ, NR_FREQ), device=DEVICE)
         data_large[:NX*NSUB:NSUB, :NY*NSUB:NSUB] = data
-        coef = torch.zeros((NSUB, NSUB), dtype=torch.complex64)
+        coef = torch.zeros((NSUB, NSUB), dtype=torch.complex64, device=DEVICE)
 
         dx = centroids[:, 1]
         dy = centroids[:, 0]
@@ -96,15 +97,12 @@ def combine_image(
                 pyi = -nvin * py
 
                 # Generate sub-grid indices
-                isatx, isaty = torch.meshgrid(torch.arange(NSUB), torch.arange(NSUB),indexing='xy')
+                isatx, isaty = torch.meshgrid(torch.arange(NSUB, device=DEVICE), torch.arange(NSUB, device=DEVICE),indexing='xy')
                 isatx = isatx.flatten()
                 isaty = isaty.flatten()
 
                 # Calculate total phase using broadcasting
                 phit = torch.outer(isatx, px) + pxi + torch.outer(isaty, py) + pyi
-
-                # phit = torch.tensor(phit)
-
                 # Compute complex phases and normalize
                 phases = (torch.cos(phit) + 1j * torch.sin(phit)) / NSUB**2
 
@@ -118,7 +116,10 @@ def combine_image(
                 else: 
                     phasem = phases
 
-                vec = torch.linalg.inv(phasem)
+                # vec = torch.linalg.inv(phasem)
+                vec = torch.linalg.pinv(phasem) # pseudo inverse
+                # I = torch.eye(phasem.shape[0], dtype=phasem.dtype, device=phasem.device)
+                # vec = torch.linalg.solve(phasem, I)
 
                 # For NSUB2 images, we are done
                 if NPP==NSUB**2:
@@ -162,7 +163,7 @@ def combine_image(
                     break
 
                 # Compute the normalized column positions (U)
-                cols = torch.arange(isu, ieu)
+                cols = torch.arange(isu, ieu, device=DEVICE)
                 U = cols / NC_FREQ  # Multiply back by 2 to match original scale
 
                 # Compute the column phase shift (as a complex exponential)
@@ -180,7 +181,7 @@ def combine_image(
                 # Compute the normalized row positions (V)
                 # print('ix', ix, 'iy', iy)
                 # print('isu', isu, 'ieu', ieu, 'isv', isv, 'iev', iev)
-                rows = torch.arange(isv-1, iev-1, -1)
+                rows = torch.arange(isv-1, iev-1, -1, device=DEVICE)
                 # rows = torch.where(rows >= 0, rows, NR_FREQ + rows) # numpy array can take negative index
                 V = torch.where(rows >= NR_FREQ // 2, (rows - NR_FREQ) / NR_FREQ, rows / NR_FREQ)
 

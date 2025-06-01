@@ -83,15 +83,12 @@ def build_param_config_dict_with_alias(
 
     # --- EXPAND grouped override keys -----------------------------------------
     # allow keys like 'image.R.dx, image.R.dy, image.C.dx' → apply same settings
-    expanded_overrides = []
-    for ov in overrides_list:
+    for i, ov in enumerate(overrides_list):
         exp = {}
         for key, settings in ov.items():
-            # split on commas, strip whitespace, re-assign
             for sub in [k.strip() for k in key.split(',')]:
                 exp[sub] = settings
-        expanded_overrides.append(exp)
-    overrides_list = expanded_overrides
+        overrides_list[i] = exp  # in-place update!
 
     # --- allowed keys & build configs -----------------------------------------
     allowed_keys = {
@@ -104,7 +101,8 @@ def build_param_config_dict_with_alias(
 
     cfgs_list = []
     # process each batch of fitting
-    for default_cfg, overrides, all_cfg in zip(default_cfgs, overrides_list, all_cfgs):
+    for i, (default_cfg, all_cfg) in enumerate(zip(default_cfgs, all_cfgs)):
+        overrides = overrides_list[i]  # still references the outer list element
         cfgs = {}
         alias_map = {}
         for name, val in raw_dict.items():
@@ -115,7 +113,7 @@ def build_param_config_dict_with_alias(
             if isinstance(val, str):
                 alias_map[full_key] = val
             else:
-                oc = overrides.get(full_key, {})  # now catches any split keys
+                oc = overrides.pop(full_key, {})  # now catches any split keys; mutate overrides to make a overrides counter
                 cfgs[full_key] = FitParamConfig(
                     name=full_key,
                     value=val,
@@ -135,7 +133,7 @@ def build_param_config_dict_with_alias(
 
     return cfgs_list
 
-def _extract_tensors(cfgs: Dict[str, FitParamConfig]):
+def _extract_tensors(cfgs: Dict[str, FitParamConfig], device: torch.device = 'cpu'):
     seen = set()
     tensors = []
     clamp_list = []
@@ -143,7 +141,7 @@ def _extract_tensors(cfgs: Dict[str, FitParamConfig]):
         if not cfg.fit:
             continue
         if cfg.tensor is None:
-            cfg.tensor = torch.tensor(cfg.value, dtype=torch.float32, requires_grad=True)
+            cfg.tensor = torch.tensor(cfg.value, dtype=torch.float32, requires_grad=True, device=device)
         if id(cfg.tensor) in seen:
             continue
         seen.add(id(cfg.tensor))
@@ -248,7 +246,7 @@ class BaseFitter(ABC):
     def _get_model_params(self, key): 
         params = {
             k.split('.')[-1]:
-            (v.tensor if v.tensor is not None else torch.tensor(v.value, dtype=torch.float32))
+            (v.tensor if v.tensor is not None else torch.tensor(v.value, dtype=torch.float32, device=self.device))
             for k,v in getattr(self, f'{key}_cfg').items()
         }
         return params
@@ -298,7 +296,7 @@ class BaseFitter(ABC):
         all_cfg = {}
         for cfg_list in self.param_config_lists.values():
             all_cfg.update(cfg_list[self.current_stage])
-        param_groups, clamp_list = _extract_tensors(all_cfg)
+        param_groups, clamp_list = _extract_tensors(all_cfg, device=self.device)
         # if there’s nothing to fit, warn and bail out
         if not param_groups:
             LOG.warning(
@@ -327,7 +325,7 @@ class BaseFitter(ABC):
 
         try: 
 
-            last_loss = torch.tensor(0) # placeholder
+            last_loss = torch.tensor(0, device=self.device) # placeholder
 
             for i in range(self.maxiter):
                 self.optimizer.zero_grad()
@@ -421,7 +419,7 @@ class KinematicsFitter(BaseFitter):
         # Image loading and wavelength
         # ─────────────────────────────
         img_cfg = self.config['image']
-        self.lambda_rest = torch.tensor([self.config['summary']['lambda_rest']]) * (1 + self.z)
+        self.lambda_rest = torch.tensor([self.config['summary']['lambda_rest']], device=self.device) * (1 + self.z)
 
         self.true_grism_R = torch.tensor(load_fits_data(img_cfg['R']['path']), device=self.device)
         self.true_grism_C = torch.tensor(load_fits_data(img_cfg['C']['path']), device=self.device)
@@ -443,6 +441,7 @@ class KinematicsFitter(BaseFitter):
         overrides = [fs['override'] for fs in self.config['fitting']]
 
         # velocity params
+        # NOTE: overrides will be mutated during iteration
         self.velocity_cfg_list = build_param_config_dict_with_alias(
             self.config['velocity'], defaults, overrides, prefix='velocity'
         )
@@ -471,6 +470,10 @@ class KinematicsFitter(BaseFitter):
             )
             cfg['image.C.forward_model'].tensor = self.fwd_models['C']
 
+        if len(overrides)>0: 
+            unused_keys = set([key for stage in overrides for key in stage.keys()])
+            LOG.warning(f'The following override keys are not used: {unused_keys}')
+
         # register into the generic param_config_lists
         self.param_config_lists = {
             'velocity':       self.velocity_cfg_list,
@@ -487,10 +490,14 @@ class KinematicsFitter(BaseFitter):
         )
 
         cxR, cyR = self.fwd_models['R'](
-            torch.tensor(self.r_fit), torch.tensor(self.r_fit), self.lambda_rest
+            torch.tensor(self.r_fit, device=self.device), 
+            torch.tensor(self.r_fit, device=self.device), 
+            self.lambda_rest
         )
         cxC, cyC = self.fwd_models['C'](
-            torch.tensor(self.r_fit), torch.tensor(self.r_fit), self.lambda_rest
+            torch.tensor(self.r_fit, device=self.device), 
+            torch.tensor(self.r_fit, device=self.device), 
+            self.lambda_rest
         )
         self.cutout_R = (int(cxR)-self.r_fit, int(cyR)-self.r_fit, 2*self.r_fit+1, 2*self.r_fit+1)
         self.cutout_C = (int(cxC)-self.r_fit, int(cyC)-self.r_fit, 2*self.r_fit+1, 2*self.r_fit+1)
@@ -633,6 +640,7 @@ class ImagesFitter(BaseFitter):
         self.psf_cfgs_lists = {}
 
         # add image params
+        # NOTE: overrides will be mutated during iteration
         for filter, imgs_cfg in self.config['direct'].items():
             for iid, raw_dict in imgs_cfg.items():
                 i_cfgs = build_param_config_dict_with_alias(
@@ -665,6 +673,10 @@ class ImagesFitter(BaseFitter):
                 all_cfgs=_all_cfgs
             )
             self.psf_cfgs_lists[cid] = p_cfgs
+
+        if len(overrides)>0: 
+            unused_keys = set([key for stage in overrides for key in stage.keys()])
+            LOG.warning(f'The following override keys are not used: {unused_keys}')
 
         # 5) Register
         self.param_config_lists = self.psf_cfgs_lists | self.sersic_cfgs_lists | self.direct_cfgs_lists
