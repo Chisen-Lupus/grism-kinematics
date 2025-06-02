@@ -304,15 +304,25 @@ class BaseFitter(ABC):
                 f'no trainable parameters in stage {self.current_stage+1}, skipping.'
             )
             return [], []
-        self.optimizer = torch.optim.Adam(param_groups)
+        
+        if fs['method']=='Adam':
+            self.optimizer = torch.optim.Adam(param_groups)
+        elif fs['method']=='LBFGS':
+            lr = fs['default']['lr']
+            flat_params = [p for g in param_groups for p in g['params']]
+            self.optimizer = torch.optim.LBFGS(flat_params, lr=lr, history_size=100)
+        else: 
+            raise ValueError(f'unknown fitting method: {fs['method']}')
+        
         self.clamp_list = clamp_list
 
         # scheduler setup
         sched_type = fs['scheduler']
         if sched_type == 'ReduceLROnPlateau':
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode='min', factor=0.707, patience=500, min_lr=1e-6
+                self.optimizer, mode='min', factor=0.707, patience=10, min_lr=1e-6
             )
+            # TODO: set patience in cfg file
         elif sched_type == 'StepLR':
             self.scheduler = torch.optim.lr_scheduler.StepLR(
                 self.optimizer, step_size=2000, gamma=0.1
@@ -327,28 +337,36 @@ class BaseFitter(ABC):
 
             last_loss = torch.tensor(0, device=self.device) # placeholder
 
-            for i in range(self.maxiter):
+            def closure():
                 self.optimizer.zero_grad()
                 loss = self.loss()
+                loss.backward()
+                return loss
 
-                # logging hook
+            for i in range(self.maxiter):
+                if isinstance(self.optimizer, torch.optim.LBFGS):
+                    # For LBFGS, step() needs a closure and returns the loss
+                    loss = self.optimizer.step(closure)
+                else:
+                    # For other optimizers, closure() returns the loss
+                    loss = closure()
+                    self.optimizer.step()
+
+                # Log and record
                 self._log(i, loss)
 
                 self.losses.append(loss.item())
                 self.lrs.append(self.optimizer.param_groups[0]['lr'])
 
-                loss.backward()
-                self.optimizer.step()
-                
-                # scheduler step
+                # Step scheduler
                 if self.scheduler:
                     if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                         self.scheduler.step(loss.item())
                     else:
                         self.scheduler.step()
 
-                # clamp values to their min/max
-                for p, min, max in clamp_list:
+                # Clamp values
+                for p, min, max in self.clamp_list:
                     p.data.clamp_(min=min, max=max)
 
                 last_loss = loss
@@ -386,7 +404,7 @@ class BaseFitter(ABC):
                     prev_cfg = cfg_list[idx-1]
                     curr_cfg = cfg_list[idx]
                     for key, cfg in curr_cfg.items():
-                        # skip forward_model entries
+                        # XXX: skip forward_model entries
                         if key.endswith('forward_model'):
                             continue
                         if key in prev_cfg:
