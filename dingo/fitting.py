@@ -36,33 +36,69 @@ def log_call(func):
 @dataclass
 class FitParamConfig:
     name: str
-    value: float
+    tensor: torch.Tensor
     lr: float
     min: float
     max: float
-    fit: bool
-    tensor: Optional[torch.Tensor] = None
 
-    def __post_init__(self):
-        self.min = float(self.min)
-        self.max = float(self.max)
+    def __init__(
+        self,
+        name: str,
+        value: Any,
+        lr: float,
+        min: Any,
+        max: Any,
+        fit: bool,
+    ):
+        self.name = name
+        self.tensor = torch.tensor(value, requires_grad=fit)
+        self.lr = lr
+        self.min = min
+        self.max = max
+        # Store the “real” fit‐flag in a private variable:
+        self._fit = bool(fit)
 
     def __repr__(self):
-        return (
+        message = (
             f'FitParamConfig('
             f'name={self.name!r}, value={self.value}, lr={self.lr}, '
-            f'fit={self.fit}, min={self.min:.2e}, max={self.max:.2e})'
+            f'fit={self._fit}'
         )
+        if isinstance(self.min, float) and isinstance(self.max, float):
+            message += 'min={self.min:.2e}, max={self.max:.2e}'
+        return message
 
     def __str__(self):
         return self.__repr__()
+
+
+    @property
+    def value(self):
+        '''
+        Always return a NumPy array (or scalar) extracted from self.tensor.
+        '''
+        return self.tensor.cpu().detach().numpy()
+
+    @property
+    def fit(self) -> bool:
+        return self._fit
+
+    @fit.setter
+    def fit(self, _fit: bool):
+        '''
+        Whenever someone does "obj.fit = True/False", we also
+        update tensor.requires_grad automatically.
+        '''
+        self._fit = bool(_fit)
+        self.tensor.requires_grad = self._fit
     
 def build_param_config_dict_with_alias(
     raw_dict: Dict[str, Any],
     default_cfgs: Any,
     overrides_list: Any,
     prefix: str, 
-    all_cfgs: dict = None
+    all_cfgs: dict = None,
+    allowed_keys_extra: dict = None
 ) -> list:
     '''
     Build a list of parameter configuration dictionaries for each fitting strategy.
@@ -97,7 +133,10 @@ def build_param_config_dict_with_alias(
         'sersic': {'I_e', 'R_e', 'n', 'x0', 'y0', 'q', 'theta'}, 
         'psf': {'I_psf', 'x_psf', 'y_psf'}, 
         'direct': {'dx', 'dy', 'wt', 'zp'} # TODO: change image to grism and alas to direct??
+        # TODO: move this part out
     }
+    if allowed_keys_extra: 
+        allowed_keys.update(allowed_keys_extra)
 
     cfgs_list = []
     # process each batch of fitting
@@ -140,8 +179,6 @@ def _extract_tensors(cfgs: Dict[str, FitParamConfig], device: torch.device = 'cp
     for cfg in cfgs.values():
         if not cfg.fit:
             continue
-        if cfg.tensor is None:
-            cfg.tensor = torch.tensor(cfg.value, dtype=torch.float32, requires_grad=True, device=device)
         if id(cfg.tensor) in seen:
             continue
         seen.add(id(cfg.tensor))
@@ -245,8 +282,7 @@ class BaseFitter(ABC):
 
     def _get_model_params(self, key): 
         params = {
-            k.split('.')[-1]:
-            (v.tensor if v.tensor is not None else torch.tensor(v.value, dtype=torch.float32, device=self.device))
+            k.split('.')[-1]: v.tensor 
             for k,v in getattr(self, f'{key}_cfg').items()
         }
         return params
@@ -298,13 +334,14 @@ class BaseFitter(ABC):
             all_cfg.update(cfg_list[self.current_stage])
         param_groups, clamp_list = _extract_tensors(all_cfg, device=self.device)
         # if there’s nothing to fit, warn and bail out
-        if not param_groups:
+
+        if len(param_groups)==0:
             LOG.warning(
                 f'[{self.__class__.__name__}] ⚠️ '
                 f'no trainable parameters in stage {self.current_stage+1}, skipping.'
             )
             return [], []
-        
+
         if fs['method']=='Adam':
             self.optimizer = torch.optim.Adam(param_groups)
         elif fs['method']=='LBFGS':
@@ -319,13 +356,15 @@ class BaseFitter(ABC):
         # scheduler setup
         sched_type = fs['scheduler']
         if sched_type == 'ReduceLROnPlateau':
+            patience = fs['_patience'] if '_patience' in fs else 100
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode='min', factor=0.707, patience=10, min_lr=1e-6
+                self.optimizer, mode='min', factor=0.707, patience=patience, min_lr=1e-6
             )
             # TODO: set patience in cfg file
         elif sched_type == 'StepLR':
+            step_size = fs['_step_size'] if '_step_size' in fs else 1000
             self.scheduler = torch.optim.lr_scheduler.StepLR(
-                self.optimizer, step_size=2000, gamma=0.1
+                self.optimizer, step_size=step_size, gamma=0.707
             )
         else: 
             LOG.warning(f'{sched_type} is not a currently supported scheduler!')
@@ -376,9 +415,9 @@ class BaseFitter(ABC):
             LOG.info(f'KeyboadrInterrupt, last step: {i}, last loss: {last_loss}')
 
         # write back final tensor values
-        for cfg in all_cfg.values():
-            if hasattr(cfg, 'tensor') and isinstance(cfg.tensor, torch.Tensor) and cfg.tensor.ndim == 0:
-                cfg.value = cfg.tensor.item()
+        # for cfg in all_cfg.values():
+        #     if hasattr(cfg, 'tensor') and isinstance(cfg.tensor, torch.Tensor) and cfg.tensor.ndim == 0:
+        #         cfg.value = cfg.tensor.item()
 
         return self.losses, self.lrs
 
@@ -405,12 +444,11 @@ class BaseFitter(ABC):
                     prev_cfg = cfg_list[idx-1]
                     curr_cfg = cfg_list[idx]
                     for key, cfg in curr_cfg.items():
-                        # XXX: skip forward_model entries
+                        # TODO: move forward_model entries outside of param group
                         if key.endswith('forward_model'):
                             continue
                         if key in prev_cfg:
-                            cfg.value = prev_cfg[key].value
-                            cfg.tensor = None
+                            cfg.tensor = prev_cfg[key].tensor
 
             # assign the up-to-date cfgs for this stage
             self._assign_cfgs_for_stage(idx)
