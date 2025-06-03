@@ -2,26 +2,29 @@
 import os, sys
 import torch 
 import numpy as np
-import scipy
+import torch
 import copy
 from typing import Callable, Any, Tuple, List, Optional
 from numpy.typing import NDArray
 
+import matplotlib.pyplot as plt
 
 def combine_image(
     normalized_atlas: List[NDArray[torch.float64]], 
     centroids: List[Tuple[float, float]], 
     wts: Optional[List[float]] = None, 
     oversample: int = 2, 
-    return_full_array = False
+    # for tesing purpose:
+    return_full_array: bool = False, 
+    overpadding: int = 0
 ) -> NDArray[torch.float64]:
     """
-    Apply phase shifts to the input data.
+    Apply phase shifts to the itorchut data.
 
     Parameters
     ----------
     normalized_atlas : list-like container of arrays
-        Input 2D array TODO
+        Itorchut 2D array TODO
     centroids : list 
         TODO
     wts : int
@@ -38,9 +41,7 @@ def combine_image(
     # REGULARIZE INPUT
 
     if wts is None:
-        wts = torch.ones(len(normalized_atlas), dtype=torch.complex64)
-    # centroids = torch.stack(centroids)
-    # wts = torch.stack(wts, dtype=torch.complex64)
+        wts = torch.ones(len(normalized_atlas))
 
     # ASSERTATION
 
@@ -50,28 +51,25 @@ def combine_image(
 
     # SOME GLOBAL FACTORS
 
-    # centroids = centroids.numpy()
     NSUB = oversample
     NPP = len(normalized_atlas)
     NX, NY = normalized_atlas[0].shape
     NX_LARGE = NX*NSUB
     NY_LARGE = NY*NSUB
-    NC_FREQ = int(2**np.ceil(np.log2(NX_LARGE))) + 2 # find the next 2^N+2 e.g. 514
+    NC_FREQ = int(2**np.ceil(np.log2(NX_LARGE))) # find the next 2^N+2 e.g. 514
     NR_FREQ = int(2**np.ceil(np.log2(NY_LARGE))) # 4x of NX_LARGE can effectlively dissipate the noise
-    # NC_FREQ = 130
-    # NR_FREQ = 128
-    DEVICE = normalized_atlas.device
+    NC_FREQ *= 2**overpadding
+    NR_FREQ *= 2**overpadding
 
 
-    Atotal = torch.zeros((NC_FREQ//2, NR_FREQ), dtype=torch.complex64, device=DEVICE)
-    F = torch.zeros((NC_FREQ, NR_FREQ), dtype=torch.complex64, device=DEVICE)
+    A_total = torch.zeros((NC_FREQ//2+1, NR_FREQ), dtype=torch.complex128)
 
-    for npos in range(len(normalized_atlas)): 
+    for torchos in range(len(normalized_atlas)): 
 
-        data = normalized_atlas[npos]
-        data_large = torch.zeros((NC_FREQ, NR_FREQ), device=DEVICE)
+        data = normalized_atlas[torchos]
+        data_large = torch.zeros((NC_FREQ, NR_FREQ))
         data_large[:NX*NSUB:NSUB, :NY*NSUB:NSUB] = data
-        coef = torch.zeros((NSUB, NSUB), dtype=torch.complex64, device=DEVICE)
+        coef = torch.zeros((NSUB, NSUB), dtype=torch.complex128)
 
         dx = centroids[:, 1]
         dy = centroids[:, 0]
@@ -84,8 +82,6 @@ def combine_image(
         for iy in range(NSUB): 
             for ix in range(NSUB): 
 
-                
-                
                 # Precompute normalized phase shifts
                 px = -2 * phix / NSUB
                 py = -2 * phiy / NSUB
@@ -97,12 +93,13 @@ def combine_image(
                 pyi = -nvin * py
 
                 # Generate sub-grid indices
-                isatx, isaty = torch.meshgrid(torch.arange(NSUB, device=DEVICE), torch.arange(NSUB, device=DEVICE),indexing='xy')
+                isatx, isaty = torch.meshgrid(torch.arange(NSUB), torch.arange(NSUB), indexing='xy')
                 isatx = isatx.flatten()
                 isaty = isaty.flatten()
 
                 # Calculate total phase using broadcasting
                 phit = torch.outer(isatx, px) + pxi + torch.outer(isaty, py) + pyi
+
                 # Compute complex phases and normalize
                 phases = (torch.cos(phit) + 1j * torch.sin(phit)) / NSUB**2
 
@@ -111,29 +108,27 @@ def combine_image(
                 phases[[0, nfund], :] = phases[[nfund, 0], :]
 
                 # Add weighting factor
-                if NPP>NSUB**2: 
-                    phasem = phases @ torch.diag(wts) @ torch.conj(phases).T
-                else: 
+                if NPP==NSUB**2:
                     phasem = phases
+                else: 
+                    phasem = phases @ torch.diag(wts) @ torch.conj(phases).T
 
-                # vec = torch.linalg.inv(phasem)
-                vec = torch.linalg.pinv(phasem) # pseudo inverse
-                # I = torch.eye(phasem.shape[0], dtype=phasem.dtype, device=phasem.device)
-                # vec = torch.linalg.solve(phasem, I)
+                vec = torch.linalg.inv(phasem)
 
                 # For NSUB2 images, we are done
                 if NPP==NSUB**2:
-                    coef[iy, ix] = vec[npos, 0]
+                    coef[iy, ix] = vec[torchos, 0]
                 # Otherwise, we need to do a little more work. Here we just solve for the fundamental image.
                 else: 
                     coef[iy, ix] = 0
                     for i in range(NSUB**2):
-                        coef[iy, ix] += vec[i, 0]*torch.conj(phases[i, npos])
+                        coef[iy, ix] += vec[i, 0]*torch.conj(phases[i, torchos])
 
-                # Add weighting factor
-                coef[iy, ix] *= wts[npos]
+                    # XXX: Moving it to the else branch means totally ignore wts for NSUB**2 images
+                    # Add weighting factor
+                    coef[iy, ix] *= wts[torchos]
 
-                # print(f'Image {npos}, power {coef[isec]*np.conj(coef[isec])}, sector {isec}')
+                # print(f'Image {torchos}, power {coef[isec]*torch.conj(coef[isec])}, sector {isec}')
 
         # print('---')
 
@@ -142,9 +137,7 @@ def combine_image(
         # BEGIN FFT2
 
         # We only need half of the transformed array since we are doing real transform
-        A_hat = torch.fft.fft2(data_large) # data_large must be (2^N, 2^N) for now
-        A_unique = A_hat[:NC_FREQ//2, :]  # shape (NC_FREQ//2, NR_FREQ)
-        A_complex = torch.conj(A_unique)
+        A_hat = torch.conj(torch.fft.rfft2(data_large, dim=(1, 0)))
 
         # END FFT2
 
@@ -157,21 +150,21 @@ def combine_image(
 
                 # Starting and ending points of this sector
                 nu = NC_FREQ//NSUB
-                isu = min(nu*ix, NC_FREQ//2)
-                ieu = min(nu*(ix+1), NC_FREQ//2)
+                isu = min(nu*ix, NC_FREQ//2+1)
+                ieu = min(nu*(ix+1), NC_FREQ//2+1)
                 if isu==ieu: 
                     break
 
                 # Compute the normalized column positions (U)
-                cols = torch.arange(isu, ieu, device=DEVICE)
+                cols = torch.arange(isu, ieu)
                 U = cols / NC_FREQ  # Multiply back by 2 to match original scale
 
                 # Compute the column phase shift (as a complex exponential)
-                cphase = torch.exp(-2j * phix[npos] * U)
+                cphase = torch.exp(-2j * phix[torchos] * U)
 
                 # process rows
 
-                nv = NR_FREQ//NSUB
+                nv = NR_FREQ//NSUB 
                 isv = NR_FREQ//2 - nv*iy
                 iev = NR_FREQ//2 - nv*(iy+1) if iy<NSUB-1 else NR_FREQ//2 - NR_FREQ
 
@@ -179,14 +172,11 @@ def combine_image(
                 coef_complex = coef[iy, ix]
 
                 # Compute the normalized row positions (V)
-                # print('ix', ix, 'iy', iy)
-                # print('isu', isu, 'ieu', ieu, 'isv', isv, 'iev', iev)
-                rows = torch.arange(isv-1, iev-1, -1, device=DEVICE)
-                # rows = torch.where(rows >= 0, rows, NR_FREQ + rows) # numpy array can take negative index
+                rows = torch.arange(isv-1, iev-1, -1)
                 V = torch.where(rows >= NR_FREQ // 2, (rows - NR_FREQ) / NR_FREQ, rows / NR_FREQ)
 
                 # Compute the row phase shift (as a complex exponential)
-                rphase = torch.exp(-2j * phiy[npos] * V)
+                rphase = torch.exp(-2j * phiy[torchos] * V)
 
                 # apply shift
 
@@ -197,21 +187,15 @@ def combine_image(
                 rows_idx = rows % NR_FREQ
                 cols_idx = cols_idx.unsqueeze(1)
                 rows_idx = rows_idx.unsqueeze(0)
-                A_complex[cols_idx, rows_idx] *= phase_shift
+                A_hat[cols_idx, rows_idx] *= phase_shift
 
-        Atotal += torch.conj(A_complex)
-
-        # print('------')
+        A_total += A_hat
 
     # END PHASE SHIFT APPLICATION
 
     # BEGIN IFFT2
-
-
-    F[:NC_FREQ//2, :] = Atotal
-    F[NC_FREQ//2+1:, 0] = torch.conj(Atotal[1:NC_FREQ//2])[:, 0].flip(dims=[0])
-    F[NC_FREQ//2+1:, 1:] = torch.conj(Atotal[1:NC_FREQ//2])[:, 1:].flip(dims=[0, 1])
-    data_rec = torch.fft.ifft2(F)
+    
+    data_rec = torch.fft.irfft2(torch.conj(A_total), s=(NC_FREQ, NR_FREQ), dim=(1, 0))
     data_real = data_rec.real
 
     # END IFFT2
