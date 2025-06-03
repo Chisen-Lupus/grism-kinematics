@@ -353,7 +353,8 @@ class BaseFitter(ABC):
                     self.optimizer.step()
 
                 # Log and record
-                self._log(i, loss)
+                cadence = fs['_log_cadence'] if '_log_cadence' in fs else 100
+                self._log(i, loss, cadence=cadence)
 
                 self.losses.append(loss.item())
                 self.lrs.append(self.optimizer.param_groups[0]['lr'])
@@ -625,8 +626,8 @@ class ImagesFitter(BaseFitter):
                 self.psfs[filter][pid]['image_map'].append(iid)
                 # add image data
                 img_data = load_fits_data(img_cfg['path'])
-                if 'cutout' in img_cfg: 
-                    x, y, dx, dy = img_cfg['cutout']
+                if '_cutout' in img_cfg: 
+                    x, y, dx, dy = img_cfg['_cutout']
                     img_data = img_data[x:x+dx, y:y+dy]
                 img_tensor = torch.tensor(
                     img_data, dtype=torch.float32, device=self.device
