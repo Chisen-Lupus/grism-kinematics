@@ -33,6 +33,21 @@ def log_call(func):
 # helper classes and functions
 # ----------------------------------------------------------------------------
 
+def ensure_float_like(x):
+    if isinstance(x, torch.Tensor):
+        return x.to(dtype=torch.float) if x.numel() == 1 else x.to(dtype=torch.float32)
+    elif isinstance(x, np.ndarray):
+        return x.astype(np.float32)
+    elif isinstance(x, (float, int)):
+        return float(x)
+    elif isinstance(x, str):
+        try:
+            return float(x)
+        except ValueError:
+            raise ValueError(f"Cannot convert string '{x}' to float.")
+    else:
+        raise TypeError(f"Unsupported type {type(x)} for float-like conversion.")
+
 @dataclass
 class FitParamConfig:
     name: str
@@ -49,12 +64,13 @@ class FitParamConfig:
         min: Any,
         max: Any,
         fit: bool,
+        device: torch.device = 'cpu'
     ):
         self.name = name
-        self.tensor = torch.tensor(value, requires_grad=fit)
+        self.tensor = torch.tensor(ensure_float_like(value), requires_grad=fit, device=device)
         self.lr = lr
-        self.min = min
-        self.max = max
+        self.min = torch.tensor(ensure_float_like(min), dtype=self.tensor.dtype, device=device)
+        self.max = torch.tensor(ensure_float_like(max), dtype=self.tensor.dtype, device=device)
         # Store the “real” fit‐flag in a private variable:
         self._fit = bool(fit)
 
@@ -98,7 +114,8 @@ def build_param_config_dict_with_alias(
     overrides_list: Any,
     prefix: str, 
     all_cfgs: dict = None,
-    allowed_keys_extra: dict = None
+    allowed_keys_extra: dict = None,
+    device: torch.device = 'cpu'
 ) -> list:
     '''
     Build a list of parameter configuration dictionaries for each fitting strategy.
@@ -159,7 +176,8 @@ def build_param_config_dict_with_alias(
                     lr=oc.get('lr', default_cfg['lr']),
                     min=oc.get('min', default_cfg['min']),
                     max=oc.get('max', default_cfg['max']),
-                    fit=oc.get('fit', default_cfg['fit'])
+                    fit=oc.get('fit', default_cfg['fit']),
+                    device=device
                 )
         # apply any string aliases
         all_cfg.update(cfgs) #joint known keys as alias candidates
@@ -311,7 +329,7 @@ class BaseFitter(ABC):
         if i == 0 or (i+1) % cadence == 0:
             LOG.info(
                 f'Stage {self.current_stage+1}, '
-                f'Step {i+1}, loss={loss.item():.3f}, '
+                f'Step {i+1}, loss={loss.item():.5g}, '
                 f'lr={self.optimizer.param_groups[0]['lr']:.5f}'
             )
 
@@ -356,7 +374,7 @@ class BaseFitter(ABC):
         # scheduler setup
         sched_type = fs['scheduler']
         if sched_type == 'ReduceLROnPlateau':
-            patience = fs['_patience'] if '_patience' in fs else 100
+            patience = fs['_patience'] if '_patience' in fs else 100    
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, mode='min', factor=0.707, patience=patience, min_lr=1e-6
             )
@@ -500,13 +518,13 @@ class KinematicsFitter(BaseFitter):
         # velocity params
         # NOTE: overrides will be mutated during iteration
         self.velocity_cfg_list = build_param_config_dict_with_alias(
-            self.config['velocity'], defaults, overrides, prefix='velocity'
+            self.config['velocity'], defaults, overrides, prefix='velocity', device=self.device
         )
 
         # dispersion R params
         self.dispersion_R_cfg_list = build_param_config_dict_with_alias(
             {k:v for k,v in img_cfg['R'].items() if k in ['dx','dy']},
-            defaults, overrides, prefix='image.R'
+            defaults, overrides, prefix='image.R', device=self.device
         )
         for cfg in self.dispersion_R_cfg_list:
             cfg['image.R.forward_model'] = FitParamConfig(
@@ -518,7 +536,7 @@ class KinematicsFitter(BaseFitter):
         # dispersion C params
         self.dispersion_C_cfg_list = build_param_config_dict_with_alias(
             {k:v for k,v in img_cfg['C'].items() if k in ['dx','dy']},
-            defaults, overrides, prefix='image.C'
+            defaults, overrides, prefix='image.C', device=self.device
         )
         for cfg in self.dispersion_C_cfg_list:
             cfg['image.C.forward_model'] = FitParamConfig(
@@ -705,7 +723,8 @@ class ImagesFitter(BaseFitter):
                     default_cfgs=defaults,
                     overrides_list=overrides,
                     prefix=f'direct.{filter}.{iid}',
-                    all_cfgs=_all_cfgs
+                    all_cfgs=_all_cfgs,
+                    device=self.device
                 )
                 self.direct_cfgs_lists[iid] = i_cfgs
 
@@ -716,7 +735,8 @@ class ImagesFitter(BaseFitter):
                 default_cfgs=defaults,
                 overrides_list=overrides,
                 prefix=f'sersic.{cid}',
-                all_cfgs=_all_cfgs
+                all_cfgs=_all_cfgs, 
+                device=self.device
             )
             self.sersic_cfgs_lists[cid] = s_cfgs
 
@@ -727,7 +747,8 @@ class ImagesFitter(BaseFitter):
                 default_cfgs=defaults,
                 overrides_list=overrides,
                 prefix=f'psf.{cid}',
-                all_cfgs=_all_cfgs
+                all_cfgs=_all_cfgs, 
+                device=self.device
             )
             self.psf_cfgs_lists[cid] = p_cfgs
 
@@ -785,7 +806,10 @@ class ImagesFitter(BaseFitter):
                     )
                     # this_image = (this_image - zp)*wt
                     this_image = (this_image - zp)/wt
-                    this_loss = torch.sum((this_model - this_image)**2)
+                    # this_loss = torch.sum((this_model - this_image)**2)
+                    this_loss = torch.sum(torch.abs((this_model - this_image)))
+                    # print(torch.sum(torch.abs(this_image)))
+                    # raise RuntimeError
                     loss += this_loss
 
         return loss

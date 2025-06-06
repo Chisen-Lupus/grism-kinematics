@@ -14,6 +14,7 @@ def combine_image(
     centroids: List[Tuple[float, float]], 
     wts: Optional[List[float]] = None, 
     oversample: int = 2, 
+    device: torch.device = 'cpu',
     # for tesing purpose:
     return_full_array: bool = False, 
     overpadding: int = 0
@@ -41,7 +42,7 @@ def combine_image(
     # REGULARIZE INPUT
 
     if wts is None:
-        wts = torch.ones(len(normalized_atlas))
+        wts = torch.ones(len(normalized_atlas), device=device)
 
     # ASSERTATION
 
@@ -62,14 +63,14 @@ def combine_image(
     NR_FREQ *= 2**overpadding
 
 
-    A_total = torch.zeros((NC_FREQ//2+1, NR_FREQ), dtype=torch.complex128)
+    A_total = torch.zeros((NC_FREQ//2+1, NR_FREQ), dtype=torch.complex64, device=device)
 
     for torchos in range(len(normalized_atlas)): 
 
         data = normalized_atlas[torchos]
         data_large = torch.zeros((NC_FREQ, NR_FREQ))
         data_large[:NX*NSUB:NSUB, :NY*NSUB:NSUB] = data
-        coef = torch.zeros((NSUB, NSUB), dtype=torch.complex128)
+        coef = torch.zeros((NSUB, NSUB), dtype=torch.complex64, device=device)
 
         dx = centroids[:, 1]
         dy = centroids[:, 0]
@@ -93,7 +94,11 @@ def combine_image(
                 pyi = -nvin * py
 
                 # Generate sub-grid indices
-                isatx, isaty = torch.meshgrid(torch.arange(NSUB), torch.arange(NSUB), indexing='xy')
+                isatx, isaty = torch.meshgrid(
+                    torch.arange(NSUB, device=device), 
+                    torch.arange(NSUB, device=device), 
+                    indexing='xy'
+                )
                 isatx = isatx.flatten()
                 isaty = isaty.flatten()
 
