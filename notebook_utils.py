@@ -177,7 +177,7 @@ class PSFFitter(ImagesFitter):
                 wts.append(wt)
                 zps.append(zp)
                 # cutouts_in.append((this_image-zp)/wt)
-                cutouts_in.append(this_image/zp)
+                cutouts_in.append(this_image)
             cutouts_in = torch.stack(cutouts_in)#.to(dtype=torch.complex128)
             centroids = torch.stack(centroids)#.to(dtype=torch.complex128)
             wts = torch.stack(wts)
@@ -185,21 +185,29 @@ class PSFFitter(ImagesFitter):
             # compute psf-level sampled model at this filter
 
             wts_c = wts.to(dtype=torch.complex64)
-            combined_image = dither.combine_image(
-                cutouts_in, 
+            combined_image_full = dither.combine_image(
+                torch.stack([c/w for c, w in zip(cutouts_in, wts)]),
+                # torch.stack([(c-z)/torch.sum(c-z) for c, z in zip(cutouts_in, zps)]),
+                # cutouts_in, 
                 centroids, 
                 wts=wts_c, 
                 oversample=self.oversample, 
-                device=self.device
+                device=self.device, 
+                return_full_array=True,
+                overpadding=1,
             )
 
             for i, iid in enumerate(img_list): 
 
-                this_cutout = cutouts_in[i]
+                # this_cutout = (cutouts_in[i]-zps[i, None, None])/torch.sum(cutouts_in[i]-zps[i, None, None])
+                this_cutout = cutouts_in[i]/zps[i, None, None]
 
                 dc = 1/2 - 1/2/self.oversample
                 nx, ny = this_cutout.shape
+                nx_large = nx*self.oversample
+                ny_large = ny*self.oversample
                 dy, dx = centroids[i]
+                combined_image = combined_image_full[:nx_large, :ny_large]
                 this_model = utils.downsample_with_shift_and_size(
                     x=combined_image, factor=self.oversample, out_size=(nx, ny), shift=(dx+dc, dy+dc), 
                 )
@@ -211,7 +219,12 @@ class PSFFitter(ImagesFitter):
 
                 this_loss = torch.sum((this_model - this_cutout)**2)
                 # print(this_loss)
-                loss += this_loss
+                mismatch_loss = torch.sum(combined_image_full[nx_large:, :]**2) \
+                              + torch.sum(combined_image_full[:, ny_large:]**2)
+                loss += this_loss + mismatch_loss*100
+                # loss += this_loss
+
+            # loss += torch.sum(zps)**2
 
         # print(loss.dtype)
 
@@ -274,6 +287,7 @@ class SpikesRemover(PSFFitter):
             wts_c = wts.to(dtype=torch.complex64)
             combined_image_full = dither.combine_image(
                 cutouts/zps[:, None, None], 
+                # (cutouts-zps[:, None, None])/torch.sum(cutouts-zps[:, None, None]),
                 # (cutouts-zps[:, None, None])/wts[:, None, None], 
                 centroids, 
                 wts=wts_c, 
@@ -296,7 +310,9 @@ class SpikesRemover(PSFFitter):
             vmax = np.abs(cutouts)*5e-2 + sigma_clipped_stats(cutouts)[2]*2e-1
             raw_dict = {'image': np.zeros((nim, nx_raw, ny_raw))}
             defaults = {
-                'lr': 1,
+                'lr': self.config['fitting'][0]['default']['lr'],
+                # 'min': -1e10, 
+                # 'max': 1e10, 
                 'min': -vmax, 
                 'max': vmax, 
                 'fit': True
@@ -333,6 +349,7 @@ class SpikesRemover(PSFFitter):
             zps = self.zps[filter]
 
             combined_err_full = dither.combine_image(
+                # (err_cutouts-zps[:, None, None])/torch.sum(err_cutouts-zps[:, None, None]),
                 err_cutouts/zps[:, None, None], 
                 # (err_cutouts-zps[:, None, None])/wts[:, None, None], 
                 centroids, 
