@@ -42,7 +42,7 @@ def combine_image(
     # REGULARIZE INPUT
 
     if wts is None:
-        wts = torch.ones(len(normalized_atlas), device=device)
+        wts = torch.ones(len(normalized_atlas), dtype=torch.complex64, device=device)
 
     # ASSERTATION
 
