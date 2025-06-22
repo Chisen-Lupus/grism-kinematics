@@ -57,7 +57,7 @@ def combine_image(
     NX, NY = normalized_atlas[0].shape
     NX_LARGE = NX*NSUB
     NY_LARGE = NY*NSUB
-    NC_FREQ = int(2**np.ceil(np.log2(NX_LARGE))) # find the next 2^N+2 e.g. 514
+    NC_FREQ = int(2**np.ceil(np.log2(NX_LARGE))) # find the next 2^N
     NR_FREQ = int(2**np.ceil(np.log2(NY_LARGE))) # 4x of NX_LARGE can effectlively dissipate the noise
     NC_FREQ *= 2**overpadding
     NR_FREQ *= 2**overpadding
@@ -65,10 +65,10 @@ def combine_image(
 
     A_total = torch.zeros((NC_FREQ//2+1, NR_FREQ), dtype=torch.complex64, device=device)
 
-    for torchos in range(len(normalized_atlas)): 
+    for npos in range(len(normalized_atlas)): 
 
-        data = normalized_atlas[torchos]
-        data_large = torch.zeros((NC_FREQ, NR_FREQ))
+        data = normalized_atlas[npos]
+        data_large = torch.zeros((NC_FREQ, NR_FREQ), device=device)
         data_large[:NX*NSUB:NSUB, :NY*NSUB:NSUB] = data
         coef = torch.zeros((NSUB, NSUB), dtype=torch.complex64, device=device)
 
@@ -118,22 +118,22 @@ def combine_image(
                 else: 
                     phasem = phases @ torch.diag(wts) @ torch.conj(phases).T
 
-                vec = torch.linalg.inv(phasem)
+                vec = torch.linalg.pinv(phasem)
 
                 # For NSUB2 images, we are done
                 if NPP==NSUB**2:
-                    coef[iy, ix] = vec[torchos, 0]
+                    coef[iy, ix] = vec[npos, 0]
                 # Otherwise, we need to do a little more work. Here we just solve for the fundamental image.
                 else: 
                     coef[iy, ix] = 0
                     for i in range(NSUB**2):
-                        coef[iy, ix] += vec[i, 0]*torch.conj(phases[i, torchos])
+                        coef[iy, ix] += vec[i, 0]*torch.conj(phases[i, npos])
 
                     # XXX: Moving it to the else branch means totally ignore wts for NSUB**2 images
                     # Add weighting factor
-                    coef[iy, ix] *= wts[torchos]
+                    coef[iy, ix] *= wts[npos]
 
-                # print(f'Image {torchos}, power {coef[isec]*torch.conj(coef[isec])}, sector {isec}')
+                # print(f'Image {npos}, power {coef[isec]*torch.conj(coef[isec])}, sector {isec}')
 
         # print('---')
 
@@ -161,11 +161,11 @@ def combine_image(
                     break
 
                 # Compute the normalized column positions (U)
-                cols = torch.arange(isu, ieu)
+                cols = torch.arange(isu, ieu, device=device)
                 U = cols / NC_FREQ  # Multiply back by 2 to match original scale
 
                 # Compute the column phase shift (as a complex exponential)
-                cphase = torch.exp(-2j * phix[torchos] * U)
+                cphase = torch.exp(-2j * phix[npos] * U)
 
                 # process rows
 
@@ -177,11 +177,11 @@ def combine_image(
                 coef_complex = coef[iy, ix]
 
                 # Compute the normalized row positions (V)
-                rows = torch.arange(isv-1, iev-1, -1)
+                rows = torch.arange(isv-1, iev-1, -1, device=device)
                 V = torch.where(rows >= NR_FREQ // 2, (rows - NR_FREQ) / NR_FREQ, rows / NR_FREQ)
 
                 # Compute the row phase shift (as a complex exponential)
-                rphase = torch.exp(-2j * phiy[torchos] * V)
+                rphase = torch.exp(-2j * phiy[npos] * V)
 
                 # apply shift
 
