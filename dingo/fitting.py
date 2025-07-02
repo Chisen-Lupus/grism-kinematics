@@ -801,9 +801,20 @@ class ImagesFitter(BaseFitter):
                     direct_params = self._get_model_params(iid)
                     nx, ny = this_image.shape
                     dx, dy, wt, zp = direct_params.values()
-                    this_model = utils.downsample_with_shift_and_size(
-                        x=model, factor=factor, out_size=(nx, ny), shift=(dx, dy), 
+
+                    # this_model = utils.downsample_with_shift_and_size(
+                    #     x=model, factor=factor, out_size=(nx, ny), shift=(dx, dy), 
+                    # )
+                    oversample = factor
+                    combined_image_hat = torch.fft.fft2(model)
+                    this_combined_image_hat = utils.fft_phase_shift(
+                        combined_image_hat, 
+                        dy*oversample,
+                        dx*oversample
                     )
+                    this_model_hat = utils.fft_bin(this_combined_image_hat, oversample)
+                    this_model = torch.fft.ifft2(this_model_hat).real
+
                     # this_image = (this_image - zp)*wt
                     this_image = (this_image - zp)/wt
                     # this_loss = torch.sum((this_model - this_image)**2)

@@ -1,3 +1,4 @@
+arr = []
 
 import os, sys
 import torch 
@@ -57,8 +58,11 @@ def combine_image(
     NX, NY = normalized_atlas[0].shape
     NX_LARGE = NX*NSUB
     NY_LARGE = NY*NSUB
-    NC_FREQ = int(2**np.ceil(np.log2(NX_LARGE))) # find the next 2^N
-    NR_FREQ = int(2**np.ceil(np.log2(NY_LARGE))) # 4x of NX_LARGE can effectlively dissipate the noise
+    NC_FREQ = int(oversample**np.ceil(np.emath.logn(oversample, NX_LARGE))) # find the next 2^N
+    NR_FREQ = int(oversample**np.ceil(np.emath.logn(oversample, NY_LARGE))) # 4x of NX_LARGE can 
+    # NC_FREQ = NX_LARGE
+    # NR_FREQ = NY_LARGE
+    # print(NC_FREQ)
     NC_FREQ *= 2**overpadding
     NR_FREQ *= 2**overpadding
 
@@ -108,6 +112,10 @@ def combine_image(
                 # Compute complex phases and normalize
                 phases = (torch.cos(phit) + 1j * torch.sin(phit)) / NSUB**2
 
+                # if ix==iy==npos==0: 
+                #     print(ix, iy, npos)
+                #     print(phases.numpy())
+
                 # Pivot the fundamental component to the first row
                 nfund = NSUB * nvin - nuin
                 phases[[0, nfund], :] = phases[[nfund, 0], :]
@@ -119,6 +127,7 @@ def combine_image(
                     phasem = phases @ torch.diag(wts) @ torch.conj(phases).T
 
                 vec = torch.linalg.pinv(phasem)
+                # print(np.angle(phasem))
 
                 # For NSUB2 images, we are done
                 if NPP==NSUB**2:
@@ -134,6 +143,11 @@ def combine_image(
                     coef[iy, ix] *= wts[npos]
 
                 # print(f'Image {npos}, power {coef[isec]*torch.conj(coef[isec])}, sector {isec}')
+                
+    
+        # global arr
+        # arr.append(coef.numpy())
+        # print(coef.numpy())
 
         # print('---')
 
@@ -158,7 +172,7 @@ def combine_image(
                 isu = min(nu*ix, NC_FREQ//2+1)
                 ieu = min(nu*(ix+1), NC_FREQ//2+1)
                 if isu==ieu: 
-                    break
+                    continue
 
                 # Compute the normalized column positions (U)
                 cols = torch.arange(isu, ieu, device=device)
@@ -172,6 +186,7 @@ def combine_image(
                 nv = NR_FREQ//NSUB 
                 isv = NR_FREQ//2 - nv*iy
                 iev = NR_FREQ//2 - nv*(iy+1) if iy<NSUB-1 else NR_FREQ//2 - NR_FREQ
+                # print(isv-NR_FREQ//2, iev-NR_FREQ//2)
 
                 # Extract the complex coefficient
                 coef_complex = coef[iy, ix]
@@ -179,14 +194,17 @@ def combine_image(
                 # Compute the normalized row positions (V)
                 rows = torch.arange(isv-1, iev-1, -1, device=device)
                 V = torch.where(rows >= NR_FREQ // 2, (rows - NR_FREQ) / NR_FREQ, rows / NR_FREQ)
-
                 # Compute the row phase shift (as a complex exponential)
                 rphase = torch.exp(-2j * phiy[npos] * V)
 
                 # apply shift
 
+                # print(coef_complex)
                 # Compute the overall phase shift (outer product for broadcasting)
                 phase_shift = coef_complex * torch.outer(cphase, rphase)
+                # print(coef_complex)
+                # print(np.angle(rphase))
+                # print(np.angle(cphase)) 
 
                 cols_idx = cols % NC_FREQ
                 rows_idx = rows % NR_FREQ
@@ -211,3 +229,158 @@ def combine_image(
         return data_real
     else:
         return combined_image
+
+
+import torch.nn.functional as F
+
+
+def pad_to_square(image_array, target_size):
+    """
+    Pads each 2D image in a 3D array to a target square size.
+
+    Parameters
+    ----------
+    image_array : np.ndarray
+        Input array of shape (n, h, w), where h and w are the current image dimensions.
+    target_size : int
+        Desired edge length of the output square images (target_size x target_size).
+
+    Returns
+    -------
+    np.ndarray
+        Padded array of shape (n, target_size, target_size).
+    """
+    if image_array.ndim != 3:
+        raise ValueError('Input array must be 3D (n, h, w)')
+    
+    n, h, w = image_array.shape
+
+    if target_size < max(h, w):
+        raise ValueError('Target size must be >= current image dimensions')
+
+    pad_top = (target_size - h)
+    pad_left = (target_size - w)
+
+
+
+    padded = F.pad(
+        image_array,
+        pad=(0, pad_left, 0, pad_top),  # pad=(left, right, top, bottom)
+        mode='constant',
+        value=0  # for constant padding
+    )
+    return padded
+
+def combine_image_test(
+    normalized_atlas: List[NDArray[torch.float64]], 
+    centroids: List[Tuple[float, float]], 
+    wts: Optional[List[float]] = None, 
+    oversample: int = 2, 
+    device: torch.device = 'cpu',
+    # for tesing purpose:
+    return_full_array: bool = False, 
+    overpadding: int = 0
+) -> NDArray[torch.float64]:
+    """
+    Apply phase shifts to the itorchut data.
+
+    Parameters
+    ----------
+    normalized_atlas : list-like container of arrays
+        Itorchut 2D array TODO
+    centroids : list 
+        TODO
+    wts : int
+        TODO
+    oversample : int
+        TODO
+
+    Returns
+    -------
+    ndarray
+        TODO
+    """
+
+    # REGULARIZE INPUT
+
+    if wts is None:
+        wts = torch.ones(len(normalized_atlas), dtype=torch.complex64, device=device)
+
+    # ASSERTATION
+
+    assert len(normalized_atlas)==len(centroids)
+    assert len(centroids)==len(wts)
+    assert len(set([im.shape for im in normalized_atlas]))==1
+
+    # CALCULATE PARAMETERS
+    
+    NSUB = oversample
+
+    N = centroids.shape[0]
+    J = NSUB * NSUB
+
+    # Create j indices
+    j_indices = torch.arange(J)
+    jx = j_indices % NSUB
+    jy = j_indices // NSUB
+
+    # Compute dot product using broadcasting
+    dxs = centroids[:, 0]
+    dys = centroids[:, 1]
+    phase = torch.outer(dxs, jx) + torch.outer(dys, jy)
+    # Apply exponential
+    Phi = torch.exp(-1j * torch.pi * phase * 2).T/NSUB**2
+    # Phi = Phi @ torch.diag(wts) @ torch.conj(Phi).T
+    Phi *= wts
+
+    Phi_inv = torch.linalg.pinv(Phi) # N x NSUB^2
+
+    # COMBINE IMAGE
+    
+    nx = normalized_atlas[0].shape[0]
+    if return_full_array:
+        nx = int(2**(np.ceil(np.emath.logn(2, nx))+overpadding))
+    # print(nx)
+    normalized_atlas_pad = pad_to_square(normalized_atlas, nx)
+
+
+    coadd_hat = torch.zeros((nx*NSUB, nx*NSUB), dtype=torch.complex128)
+    # coadd_hat = 0
+
+    for idx in range(len(normalized_atlas_pad)):
+
+        dy, dx = torch.tensor(centroids[idx])
+        im = normalized_atlas_pad[idx]
+        coef = Phi_inv[idx]
+        wt = wts[idx]
+        # print(coef)
+        
+        im_hat = torch.fft.fft2(im)
+        im_hat_large = torch.tile(im_hat, (NSUB, NSUB))
+        
+        # print(torch.linalg.norm(im_hat_large - torch.tile(im_hat, (NSUB, NSUB))))
+        fx = torch.fft.fftfreq(nx*NSUB, d=1.0)
+        fy = torch.fft.fftfreq(nx*NSUB, d=1.0)
+
+        # Meshgrid of frequencies
+        v, u = torch.meshgrid(fy, fx, indexing='ij')  # (H, W)
+
+        # Apply phase shift
+        phase_shift = torch.exp(-2j * torch.pi * (-u * dy - v * dx) * NSUB)
+        
+        rgrid = torch.linspace(-1, 0, steps=nx+1)[:-1]  # remove last point
+        rphase1 = torch.exp(1j * dy * rgrid * 2 * torch.pi)
+        cgrid = torch.linspace(-1, 0, steps=nx+1)[:-1]
+        cphase1 = torch.exp(1j * dx * cgrid * 2 * torch.pi)
+        
+        im_hat_large *= phase_shift 
+        
+        for i in range(NSUB):
+            for j in range(NSUB):
+                    index = i*NSUB+j
+                    sec_hat = im_hat*coef[index]*torch.outer(cphase1, rphase1)*wt
+                    coadd_hat[i*nx:(i+1)*nx, j*nx:(j+1)*nx] += sec_hat
+                    
+    coadd_hat = torch.roll(torch.roll(coadd_hat, shifts=-nx, dims=1), shifts=-nx, dims=0)
+    
+    return torch.fft.ifft2(coadd_hat).real

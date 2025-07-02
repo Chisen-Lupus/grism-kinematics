@@ -406,6 +406,7 @@ def downsample_with_shift_and_size(
     factor: int,
     out_size: tuple[int,int],
     shift: tuple[float,float],
+    mode: str = 'bicubic'
 ) -> torch.Tensor:
     """
     Downsample a 2D image by integer `factor` with exact block-averaging,
@@ -468,7 +469,7 @@ def downsample_with_shift_and_size(
     # 5) bilinearly sample the *integrated* map at those fractional starts
     sampled = F.grid_sample(
         conv, grid,
-        mode='bicubic',
+        mode=mode,
         padding_mode='zeros',
         align_corners=True
     )
@@ -478,3 +479,69 @@ def downsample_with_shift_and_size(
     y = sampled / (f*f)   # still (1,1,H_out,W_out)
 
     return y[0,0]
+
+
+def fft_bin(ps, n):
+    """
+    Perform binning in Fourier space by summing over all nxn frequency blocks,
+    simulating alias folding from real-space binning.
+
+    Assumes ps is fftshifted and shape is (n*k, n*k).
+
+    Parameters
+    ----------
+    ps : torch.Tensor
+        2D fftshifted complex FFT of shape (N, N), where N = n * k.
+    n : int
+        Binning factor.
+
+    Returns
+    -------
+    c_hat : torch.Tensor
+        Folded (binned) Fourier image of shape (N//n, N//n),
+        still in fftshifted form.
+    """
+    N = ps.shape[0]
+    assert ps.shape[0] == ps.shape[1], "Input must be square"
+    assert N % n == 0, "Size must be divisible by binning factor"
+
+    k = N // n
+    c_hat = torch.zeros((k, k), dtype=ps.dtype, device=ps.device)
+    for i in range(n):
+        for j in range(n):
+            c_hat += ps[k*i:k*(i+1), k*j:k*(j+1)]
+
+    return c_hat/n**2
+
+def fft_phase_shift(F, dx, dy):
+    """
+    Shift a 2D image by (dx, dy) using FFT phase shift.
+
+    Parameters
+    ----------
+    F : torch.Tensor
+        2D tensor (H, W), assumed float32 or float64.
+    dx, dy : float
+        Subpixel shifts in x (columns) and y (rows).
+
+    Returns
+    -------
+    torch.Tensor
+        Shifted image of same shape.
+    """
+    H, W = F.shape
+    device = F.device
+    dtype = F.dtype
+
+    # Frequencies in cycles per pixel (normalized)
+    fx = torch.fft.fftfreq(W, d=1.0).to(device=device, dtype=dtype)
+    fy = torch.fft.fftfreq(H, d=1.0).to(device=device, dtype=dtype)
+
+    # Meshgrid of frequencies
+    v, u = torch.meshgrid(fy, fx, indexing='ij')  # (H, W)
+
+    # Apply phase shift
+    phase_shift = torch.exp(-2j * torch.pi * (u * dx + v * dy))
+    F_shifted = F * phase_shift
+
+    return F_shifted

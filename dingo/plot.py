@@ -124,6 +124,7 @@ def plot_image_fitting_result(true_image, gal_model, psf_model):
         else:
             # compute per‐panel σ for asinhstretch
             _, _, std = sigma_clipped_stats(img)
+            if std<=0: std = 1e-5
             norm = AsinhNorm(std, vmin=np.min(img), vmax=np.max(img))
             im = ax.imshow(img, norm=norm)
 
