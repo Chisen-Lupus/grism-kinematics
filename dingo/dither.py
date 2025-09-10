@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import torch
 import copy
+import scipy
 from typing import Callable, Any, Tuple, List, Optional
 from numpy.typing import NDArray
 
@@ -50,6 +51,40 @@ def combine_image(
     assert len(normalized_atlas)==len(centroids)
     assert len(centroids)==len(wts)
     assert len(set([im.shape for im in normalized_atlas]))==1
+
+    # TEMPORARY SOLUTION WHEN 2X DITHER IS PENDING REFRACTOR
+    
+    if oversample==2: 
+        combined_image = combine_image_2x(
+            normalized_atlas, centroids, wts, oversample, device, 
+            return_full_array, overpadding
+        )
+
+    elif oversample%2==1:
+        combined_image = combine_image_3x(
+            normalized_atlas, centroids, wts, oversample, device
+        )
+
+    else:
+        raise NotImplementedError()
+
+
+    return combined_image
+
+
+def combine_image_2x(
+    normalized_atlas: List[NDArray[torch.float64]], 
+    centroids: List[Tuple[float, float]], 
+    wts: Optional[List[float]] = None, 
+    oversample: int = 2, 
+    device: torch.device = 'cpu',
+    # for tesing purpose:
+    return_full_array: bool = False, 
+    overpadding: int = 0
+) -> NDArray[torch.float64]:
+    '''
+    Accelerated method from Lauer (99), does not handle dither more than 2x
+    '''
 
     # SOME GLOBAL FACTORS
 
@@ -384,3 +419,109 @@ def combine_image_test(
     coadd_hat = torch.roll(torch.roll(coadd_hat, shifts=-nx, dims=1), shifts=-nx, dims=0)
     
     return torch.fft.ifft2(coadd_hat).real
+
+
+def combine_image_3x(
+    normalized_atlas: List[torch.Tensor], 
+    centroids: List[Tuple[float, float]], 
+    wts: Optional[List[float]] = None, 
+    oversample: int = 3, 
+    device: torch.device = 'cpu',
+):
+    '''
+    Refractored implementation for 3x dither and more
+    NOTE: wt = 1/sigma**2
+    '''
+
+    NSUB = oversample
+    N = len(centroids)
+    dither_images = normalized_atlas
+    
+    # Create j indices
+    center_offset = NSUB // 2
+    jy, jx = torch.tensor(np.indices((NSUB, NSUB)), device=device)
+    jx = (jx - center_offset).ravel()
+    jy = (jy - center_offset).ravel()
+    # Compute dot product using broadcasting
+    dxs = -centroids[:, 0]
+    dys = -centroids[:, 1]
+    phase = torch.outer(jx, dxs) + torch.outer(jy, dys)
+    # Apply exponential
+    Phi = torch.exp(2j * torch.pi * phase * NSUB / NSUB)/NSUB**2
+    D = (torch.sqrt(wts))[None,:] # works as diag(sqrt(wts)) but faster
+    Phi_inv = (D.T) * torch.linalg.pinv(Phi * D)
+
+    nx, ny = dither_images[0].shape
+    nx_in = scipy.fft.next_fast_len(nx)
+    ny_in = scipy.fft.next_fast_len(ny)
+    dither_images_in = torch.zeros((N, nx_in, ny_in), dtype=torch.complex64, device=device)
+    dither_images_in[:, :nx, :ny] = dither_images
+    coadd_hat = torch.zeros((nx_in*NSUB, ny_in*NSUB), dtype=torch.complex64, device=device)
+
+    # ================
+
+    # proceed each image
+    # for iim in range(N):
+
+    #     dy, dx = centroids[iim]
+    #     im = dither_images_in[iim][:nx_in, :ny_in]
+    #     im_hat = torch.fft.fft2(im)
+    #     im_hat = torch.fft.fftshift(im_hat)
+        
+    #     fx = torch.fft.fftfreq(nx_in, d=1.0, device=device)
+    #     fy = torch.fft.fftfreq(ny_in, d=1.0, device=device)
+    #     fx = torch.fft.fftshift(fx)
+    #     fy = torch.fft.fftshift(fy)
+    #     v, u = torch.meshgrid(fx, fy, indexing='ij')  # (H, W)
+
+    #     phase_shift = torch.exp(2j * np.pi * (u * dy + v * dx))
+        
+    #     # proceed each tile
+    #     for i in range(NSUB):
+    #         for j in range(NSUB):
+    #                 itile = i*NSUB+j
+    #                 sec_coef = Phi_inv[iim, itile]
+                    
+    #                 sec_hat = im_hat.clone()
+    #                 sec_hat *= sec_coef
+    #                 sec_hat *= phase_shift                
+                    
+    #                 coadd_hat[i*nx_in:(i+1)*nx_in, j*ny_in:(j+1)*ny_in] += sec_hat
+
+    # ================
+    
+    # EQUIVALENT BUT FASTER:
+
+    # 1) frequency grids
+    fx = torch.fft.fftfreq(nx_in, d=1.0, device=device)
+    fy = torch.fft.fftfreq(ny_in, d=1.0, device=device)
+    fx = torch.fft.fftshift(fx)  # (nx_in,)
+    fy = torch.fft.fftshift(fy)  # (ny_in,)
+    v, u = torch.meshgrid(fx, fy, indexing='ij')  # (nx_in, ny_in)
+
+    # 2) batch FFT
+    im_hat = torch.fft.fftshift(torch.fft.fft2(dither_images_in, dim=(-2,-1)), dim=(-2,-1))  # (N, nx_in, ny_in)
+
+    # 3) batch calculate phase shift
+    dy = centroids[:, 0].reshape(N, 1, 1)
+    dx = centroids[:, 1].reshape(N, 1, 1)
+    phase = torch.exp(2j*torch.pi*(u*dy + v*dx))  # (N, nx_in, ny_in), 复数
+
+    # 4) apply phase shift 
+    hat_shifted = im_hat * phase  # (N, nx_in, ny_in)
+
+    # 5) apply phase shift and coefficient
+    S = torch.einsum('nj,nhw->jhw', Phi_inv, hat_shifted)  # (J, nx_in, ny_in)
+
+    # 6) merge the array to a large power spectrum
+    coadd_hat = (
+        S.view(NSUB, NSUB, nx_in, ny_in)    # (NSUB, NSUB, nx_in, ny_in)
+        .permute(0, 2, 1, 3)               # (NSUB, nx_in, NSUB, ny_in)
+        .reshape(NSUB*nx_in, NSUB*ny_in)   # (NSUB*nx_in, NSUB*ny_in)
+    )
+    
+    # ================
+
+    combined_image = torch.fft.ifft2(torch.fft.ifftshift(coadd_hat)).real
+    
+    return combined_image
