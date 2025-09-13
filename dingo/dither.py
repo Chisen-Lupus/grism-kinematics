@@ -55,7 +55,7 @@ def combine_image(
     # TEMPORARY SOLUTION WHEN 2X DITHER IS PENDING REFRACTOR
     
     if oversample==2: 
-        combined_image = combine_image_2x(
+        combined_image = combine_image_test(
             normalized_atlas, centroids, wts, oversample, device, 
             return_full_array, overpadding
         )
@@ -460,7 +460,8 @@ def combine_image_3x(
 
     # ================
 
-    # proceed each image
+    # proceed each image KEEP THIS FOE DEBUG USE
+
     # for iim in range(N):
 
     #     dy, dx = centroids[iim]
@@ -522,6 +523,7 @@ def combine_image_3x(
     
     # ================
 
-    combined_image = torch.fft.ifft2(torch.fft.ifftshift(coadd_hat)).real
-    
+    coadd = torch.fft.ifft2(torch.fft.ifftshift(coadd_hat))
+    combined_image = coadd.real[:nx*NSUB, :ny*NSUB]
+
     return combined_image
