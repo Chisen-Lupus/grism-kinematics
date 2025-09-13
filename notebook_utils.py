@@ -194,6 +194,40 @@ def fft_phase_shift(F, dx, dy):
 
     return F_shifted
 
+def sigma_clipped_std(arr, sigma=3.0, max_iter=5):
+    """
+    Compute sigma-clipped standard deviation (default 3σ) in PyTorch.
+    Input can be multi-dimensional but is flattened internally.
+    
+    Parameters
+    ----------
+    arr : torch.Tensor
+        Input tensor (any shape).
+    sigma : float
+        Sigma threshold for clipping.
+    max_iter : int
+        Number of iterations for clipping.
+    
+    Returns
+    -------
+    std : torch.Tensor (scalar)
+        The clipped standard deviation.
+    """
+    data = arr.reshape(-1).clone()
+    
+    for _ in range(max_iter):
+        mean = data.mean()
+        std = data.std(unbiased=True)
+        mask = (data > mean - sigma*std) & (data < mean + sigma*std)
+        new_data = data[mask]
+        # if no change, stop early
+        if new_data.numel() == data.numel():
+            break
+        data = new_data
+    
+    return data.std(unbiased=True)
+
+#%% --------------------------------------------------------------------------
 
 class PSFFitter(ImagesFitter):
     
@@ -300,12 +334,13 @@ class PSFFitter(ImagesFitter):
                 # torch.stack([(c-z)/torch.sum(c-z) for c, z in zip(cutouts_in, zps)]),
                 # cutouts_in, 
                 centroids, 
-                wts=wts_c**2, 
+                wts=wts_c, 
                 oversample=oversample, 
                 device=self.device, 
                 return_full_array=False,
                 overpadding=1,
             )
+            combined_image_hat = torch.fft.fft2(combined_image)
 
             # for i, iid in enumerate(img_list): 
 
@@ -324,45 +359,67 @@ class PSFFitter(ImagesFitter):
             #     # this_model = bin(this_combined_image, oversample)
 
             #     # print(torch.sum(this_model**2), torch.sum(this_cutout**2))
-            #     residual_loss = torch.sum((this_model - this_cutout)**2)
+            #     residual_loss = torch.sum(((this_model - this_cutout)*scales[i]+zps[i])**2)
             #     # mismatch_loss = torch.sum(combined_image_full[nx_large:, :]**2) \
             #     #               + torch.sum(combined_image_full[:, ny_large:]**2)
             #     # loss += residual_loss + mismatch_loss*100
             #     loss += residual_loss
-
-
-
-            def spectrum_monotonic_loss(combined_image):
-                # FFT and power spectrum
-                fft_img = torch.fft.fftshift(torch.fft.fft2(combined_image))
-                power = torch.abs(fft_img)**2   # (nx, ny)
-
-                nx, ny = power.shape
-                cx, cy = nx//2, ny//2
-
-                # radius map
-                y, x = torch.meshgrid(
-                    torch.arange(nx, device=power.device) - cx,
-                    torch.arange(ny, device=power.device) - cy,
-                    indexing='ij'
-                )
-                r = torch.sqrt(x**2 + y**2).reshape(-1)
-                p = power.reshape(-1)
-
-                # 按半径排序
-                idx = torch.argsort(r)
-                r_sorted = r[idx]
-                p_sorted = p[idx]
-
-                # 差分：要求 p_sorted[i] <= p_sorted[i-1]
-                diff = p_sorted[:-1] - p_sorted[1:]
-                violation = torch.relu(-diff)   # 只保留违反单调递减的部分
-
-                loss = violation.sum() / p.numel()  # 可换成 mean
-                return loss
-
-            loss = spectrum_monotonic_loss(combined_image)
             
+            
+            # 前提：以下张量都已在 mps:0，且与原先保持相同 dtype（建议：combined_image_hat 为 complex64，
+            # cutouts/centroids/zps/scales 为 float32）。oversample = n，且 H=W=n*h=n*w。
+            # combined_image_hat: [H, W] complex
+            # cutouts_in:        [N, h, w] float
+            # zps, scales:       [N] float
+            # centroids:         [N, 2] float，每行为 (dy, dx)   # 注意你原来是 [dy, dx]
+
+            N, h, w = cutouts_in.shape
+            H, W = combined_image_hat.shape
+            n = oversample
+            assert H == W and H % n == 0 and W % n == 0, '尺寸需为方阵，且可被 oversample 整除'
+            k = H // n
+            assert h == k and w == k, '下采样后尺寸需与 cutouts 匹配'
+
+            # 1) 与原先一致的 cutout 归一化（逐样本）
+            #    this_cutout = (cutouts_in[i]-zps[i])/scales[i]
+            this_cutouts = (cutouts_in - zps[:, None, None]) / scales[:, None, None]   # [N, h, w]
+
+            # 2) 批量化的频域相位平移（严格复刻你的 fft_phase_shift）
+            #    你的函数：F * exp(-2πi(u*dx + v*dy))，
+            #    调用时传的是 (dy*oversample, dx*oversample) 映射到 (dx, dy) 形参，因此我们保持：
+            #      dx_param = dy*oversample, dy_param = dx*oversample
+            #    meshgrid 用 v,u = meshgrid(fy, fx, indexing='ij')，也保持一致。
+            real_dtype = combined_image_hat.real.dtype
+            fx = torch.fft.fftfreq(W, d=1.0).to(device=combined_image_hat.device, dtype=real_dtype)
+            fy = torch.fft.fftfreq(H, d=1.0).to(device=combined_image_hat.device, dtype=real_dtype)
+            v, u = torch.meshgrid(fy, fx, indexing='ij')                     # [H, W]
+
+            # 提取 (dy, dx)，并按你原来的调用方式乘 oversample 后映射到 (dx_param, dy_param)
+            dy = centroids[:, 0].to(real_dtype)   # 原 centroids 存的是 [dy, dx]
+            dx = centroids[:, 1].to(real_dtype)
+            dx_param = dy * n
+            dy_param = dx * n
+
+            # 相位：exp(-2πi(u*dx_param + v*dy_param))。为确保 dtype 完全一致，强制到 combined_image_hat.dtype。
+            phase = torch.exp(-2j*torch.pi * (
+                u[None, :, :] * dx_param[:, None, None] +
+                v[None, :, :] * dy_param[:, None, None]
+            )).to(dtype=combined_image_hat.dtype)                                  # [N, H, W] complex
+
+            shifted = combined_image_hat[None, :, :] * phase                       # [N, H, W] complex
+
+            # 3) 频域 bin（严格等价于你的 fft_bin：把 N=n*k 拆成 (n,k)，对 n 维求和，再除以 n**2）
+            #    你的 fft_bin 等价于：对索引 (a*k+b, c*k+d) 按 (b,d) 聚合所有 a,c。
+            binned_hat = shifted.reshape(N, n, k, n, k).sum(dim=(1, 3)) / (n**2)   # [N, k, k] complex
+
+            # 4) 批量 ifft2 与取实部（与你原代码一致）
+            models = torch.fft.ifft2(binned_hat).real                               # [N, h, w] float
+
+            # 5) 批量 L2 残差（与你原来 loss 累加完全一致的定义）
+            # residual = (models - this_cutouts)*scales[:, None, None]+zps[:, None, None]                                        # [N, h, w]
+            residual = models - this_cutouts                # [N, h, w]
+            loss = torch.sum(residual * residual)                                   # 标量
+
 
         return loss
 
