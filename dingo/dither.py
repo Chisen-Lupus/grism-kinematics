@@ -430,7 +430,7 @@ def combine_image_3x(
 ):
     '''
     Refractored implementation for 3x dither and more
-    NOTE: wt = 1/sigma**2
+    NOTE: wt is the same scale as SNR, not 1/sigma**2
     '''
 
     NSUB = oversample
@@ -448,7 +448,7 @@ def combine_image_3x(
     phase = torch.outer(jx, dxs) + torch.outer(jy, dys)
     # Apply exponential
     Phi = torch.exp(2j * torch.pi * phase * NSUB / NSUB)/NSUB**2
-    D = (torch.sqrt(wts))[None,:] # works as diag(sqrt(wts)) but faster
+    D = wts[None,:] # works as diag(wts) but faster
     Phi_inv = (D.T) * torch.linalg.pinv(Phi * D)
 
     nx, ny = dither_images[0].shape
