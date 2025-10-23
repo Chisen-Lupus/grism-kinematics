@@ -372,20 +372,32 @@ class BaseFitter(ABC):
         self.clamp_list = clamp_list
 
         # scheduler setup
+        # main scueduler
         sched_type = fs['scheduler']
         if sched_type == 'ReduceLROnPlateau':
             patience = fs['_patience'] if '_patience' in fs else 100    
-            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            sched_main = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, mode='min', factor=0.707, patience=patience, min_lr=1e-6
             )
             # TODO: set patience in cfg file
         elif sched_type == 'StepLR':
             step_size = fs['_step_size'] if '_step_size' in fs else 1000
-            self.scheduler = torch.optim.lr_scheduler.StepLR(
+            sched_main = torch.optim.lr_scheduler.StepLR(
                 self.optimizer, step_size=step_size, gamma=0.707
             )
         else: 
             LOG.warning(f'{sched_type} is not a currently supported scheduler!')
+        # warmup scheduler and connection
+        if '_warmup_size' in fs and fs['_warmup_size']>0:
+            warmup_iters = fs['_warmup_size']
+            sched_warmup = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer, start_factor=0.1, end_factor=1, total_iters=warmup_iters
+            )
+            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer, schedulers=[sched_warmup, sched_main], milestones=[warmup_iters]
+            )
+        else: 
+            self.scheduler = sched_main
 
         self.losses = []
         self.lrs    = []
