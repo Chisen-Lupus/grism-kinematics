@@ -85,10 +85,43 @@ def plot_fits_footprints(agn_coord, star_coords, used_files):
     ax.xaxis.set_inverted(True)
     plt.tight_layout()
     plt.show()
+    
+def sigma_clipped_std(arr, sigma=3.0, max_iter=5):
+    """
+    Compute sigma-clipped standard deviation (default 3σ) in PyTorch.
+    Input can be multi-dimensional but is flattened internally.
+    
+    Parameters
+    ----------
+    arr : torch.Tensor
+        Input tensor (any shape).
+    sigma : float
+        Sigma threshold for clipping.
+    max_iter : int
+        Number of iterations for clipping.
+    
+    Returns
+    -------
+    std : torch.Tensor (scalar)
+        The clipped standard deviation.
+    """
+    data = arr.reshape(-1).clone()
+    
+    for _ in range(max_iter):
+        mean = data.mean()
+        std = data.std(unbiased=True)
+        mask = (data > mean - sigma*std) & (data < mean + sigma*std)
+        new_data = data[mask]
+        # if no change, stop early
+        if new_data.numel() == data.numel():
+            break
+        data = new_data
+    
+    return data.std(unbiased=True)
 
 #%% --------------------------------------------------------------------------
 
-def asinhstretch(im): return np.arcsinh(im/sigma_clipped_stats(im)[2])
+def asinhstretch(im): return np.arcsinh(im/sigma_clipped_stats(im[np.isfinite(im)])[2])
 
 def simple_grid_plot(cutouts, stretch=True):
     ny = int(np.sqrt(len(cutouts)-1))+1
@@ -193,39 +226,6 @@ def fft_phase_shift(F, dx, dy):
     F_shifted = F * phase_shift
 
     return F_shifted
-
-def sigma_clipped_std(arr, sigma=3.0, max_iter=5):
-    """
-    Compute sigma-clipped standard deviation (default 3σ) in PyTorch.
-    Input can be multi-dimensional but is flattened internally.
-    
-    Parameters
-    ----------
-    arr : torch.Tensor
-        Input tensor (any shape).
-    sigma : float
-        Sigma threshold for clipping.
-    max_iter : int
-        Number of iterations for clipping.
-    
-    Returns
-    -------
-    std : torch.Tensor (scalar)
-        The clipped standard deviation.
-    """
-    data = arr.reshape(-1).clone()
-    
-    for _ in range(max_iter):
-        mean = data.mean()
-        std = data.std(unbiased=True)
-        mask = (data > mean - sigma*std) & (data < mean + sigma*std)
-        new_data = data[mask]
-        # if no change, stop early
-        if new_data.numel() == data.numel():
-            break
-        data = new_data
-    
-    return data.std(unbiased=True)
 
 #%% --------------------------------------------------------------------------
 
@@ -340,39 +340,8 @@ class PSFFitter(ImagesFitter):
                 return_full_array=False,
                 overpadding=1,
             )
+                
             combined_image_hat = torch.fft.fft2(combined_image)
-
-            # for i, iid in enumerate(img_list): 
-
-            #     this_cutout = (cutouts_in[i]-zps[i])/scales[i]
-            #     dy, dx = centroids[i]
-
-            #     this_combined_image_hat = fft_phase_shift(
-            #         combined_image_hat, 
-            #         dy*oversample,
-            #         dx*oversample
-            #     )
-            #     this_model_hat = fft_bin(this_combined_image_hat, oversample)
-            #     this_model = torch.fft.ifft2(this_model_hat).real
-            #     # this_combined_image_full = fft_phase_shift(combined_image_full_hat, dy+dc, dx+dc)
-            #     # this_combined_image = this_combined_image_full[:nx_large, :ny_large]
-            #     # this_model = bin(this_combined_image, oversample)
-
-            #     # print(torch.sum(this_model**2), torch.sum(this_cutout**2))
-            #     residual_loss = torch.sum(((this_model - this_cutout)*scales[i]+zps[i])**2)
-            #     # mismatch_loss = torch.sum(combined_image_full[nx_large:, :]**2) \
-            #     #               + torch.sum(combined_image_full[:, ny_large:]**2)
-            #     # loss += residual_loss + mismatch_loss*100
-            #     loss += residual_loss
-            
-            
-            # 前提：以下张量都已在 mps:0，且与原先保持相同 dtype（建议：combined_image_hat 为 complex64，
-            # cutouts/centroids/zps/scales 为 float32）。oversample = n，且 H=W=n*h=n*w。
-            # combined_image_hat: [H, W] complex
-            # cutouts_in:        [N, h, w] float
-            # zps, scales:       [N] float
-            # centroids:         [N, 2] float，每行为 (dy, dx)   # 注意你原来是 [dy, dx]
-
             N, h, w = cutouts_in.shape
             H, W = combined_image_hat.shape
             n = oversample
@@ -409,17 +378,30 @@ class PSFFitter(ImagesFitter):
             shifted = combined_image_hat[None, :, :] * phase                       # [N, H, W] complex
 
             # 3) 频域 bin（严格等价于你的 fft_bin：把 N=n*k 拆成 (n,k)，对 n 维求和，再除以 n**2）
-            #    你的 fft_bin 等价于：对索引 (a*k+b, c*k+d) 按 (b,d) 聚合所有 a,c。
+            #    你的 fft_bin 等价于：对索引 (a*k+b, c*k+d) 按 å(b,d) 聚合所有 a,c。
             binned_hat = shifted.reshape(N, n, k, n, k).sum(dim=(1, 3)) / (n**2)   # [N, k, k] complex
 
             # 4) 批量 ifft2 与取实部（与你原代码一致）
             models = torch.fft.ifft2(binned_hat).real                               # [N, h, w] float
 
             # 5) 批量 L2 残差（与你原来 loss 累加完全一致的定义）
-            # residual = (models - this_cutouts)*scales[:, None, None]+zps[:, None, None]                                        # [N, h, w]
-            residual = models - this_cutouts                # [N, h, w]
-            loss = torch.sum(residual * residual)                                   # 标量
-
+            
+            # loss part ----------
+            
+            # residual = (models - this_cutouts)*scales[:, None, None]+zps[:, None, None] # [N, h, w]
+            residual = models - this_cutouts # [N, h, w]
+            # loss = torch.sum(residual * residual) # 标量
+            residual_loss = torch.sum(torch.abs(residual))
+            loss += residual_loss
+            
+            # loss = (sigma_clipped_std(combined_image)*N*h*w)**2
+            sigma_loss = sigma_clipped_std(combined_image, sigma=2)*N*h*w
+            factor = (residual_loss/sigma_loss).detach() # NOTE: detach so that it will not degenerate to 2*residual_loss
+            # factor = 1
+            # print(factor)
+            # raise RuntimeError
+            loss += sigma_loss * factor * 8
+            
 
         return loss
 
@@ -485,15 +467,16 @@ class SpikesRemover(PSFFitter):
 
             # compute psf-level sampled model at this filter
             wts_c = wts.to(dtype=torch.complex64)
+            N, nx, ny= cutouts.shape
+            cutouts_full = torch.zeros((N, nx*2, ny*2), dtype=cutouts.dtype)
+            cutouts_full[:N, :nx, :ny] = cutouts
             combined_image_full = dither.combine_image(
-                torch.stack([(c-z)/s for c, z, s in zip(cutouts, zps, scales)]),
+                torch.stack([(c-z)/s for c, z, s in zip(cutouts_full, zps, scales)]),
                 # (cutouts-zps[:, None, None])/torch.sum(cutouts-zps[:, None, None]),
                 # (cutouts-zps[:, None, None])/wts[:, None, None], 
                 centroids, 
                 wts=wts_c, 
                 oversample=self.oversample, 
-                return_full_array=True, 
-                overpadding=1,
                 device=self.device
             )
             
@@ -550,13 +533,14 @@ class SpikesRemover(PSFFitter):
             zps = self.zps[filter]
             scales = self.scales[filter]
 
+            N, nx, ny= err_cutouts.shape
+            err_cutouts_full = torch.zeros((N, nx*2, ny*2), dtype=err_cutouts.dtype)
+            err_cutouts_full[:N, :nx, :ny] = err_cutouts
             combined_err_full = dither.combine_image(
-                torch.stack([(c-z)/s for c, z, s in zip(err_cutouts, zps, scales)]),
+                torch.stack([(c-z)/s for c, z, s in zip(err_cutouts_full, zps, scales)]),
                 centroids, 
                 wts=wts.to(dtype=torch.complex64), 
                 oversample=self.oversample, 
-                return_full_array=True, 
-                overpadding=1,
                 device=self.device
             )
 
