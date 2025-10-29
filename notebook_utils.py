@@ -392,15 +392,13 @@ class PSFFitter(ImagesFitter):
             residual = models - this_cutouts # [N, h, w]
             # loss = torch.sum(residual * residual) # 标量
             residual_loss = torch.sum(torch.abs(residual))
-            loss += residual_loss
+            residual_wt = self.config['_loss']['residual']
+            loss += residual_loss*residual_wt
             
-            # loss = (sigma_clipped_std(combined_image)*N*h*w)**2
             sigma_loss = sigma_clipped_std(combined_image, sigma=2)*N*h*w
             factor = (residual_loss/sigma_loss).detach() # NOTE: detach so that it will not degenerate to 2*residual_loss
-            # factor = 1
-            # print(factor)
-            # raise RuntimeError
-            loss += sigma_loss * factor * 8
+            sigma_wt = self.config['_loss']['sigma']
+            loss += sigma_loss*sigma_wt
             
 
         return loss
