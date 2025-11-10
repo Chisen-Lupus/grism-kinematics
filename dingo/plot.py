@@ -73,7 +73,7 @@ def plot_kinematics_fitting_result(true_im, model_im, vz, diff_im, title_prefix,
     axs_row[3].grid(False)
     plt.colorbar(im2, ax=axs_row[3], fraction=0.046, pad=0.04)
 
-def plot_loss_and_lr(losses, lrs, steps=None):
+def plot_loss_and_lr(losses, lrs, steps=None, filename=None):
 
     if steps is None:
         steps = range(len(losses))
@@ -97,6 +97,8 @@ def plot_loss_and_lr(losses, lrs, steps=None):
 
     fig.tight_layout()
     plt.title('Loss and Learning Rate Evolution')
+    if filename:
+        plt.savefig(filename)
     plt.show()
 
 def plot_image_fitting_result(true_image, gal_model, psf_model):

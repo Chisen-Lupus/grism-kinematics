@@ -38,7 +38,7 @@ if not LOG.handlers:
 
 #%% --------------------------------------------------------------------------
 
-def plot_fits_footprints(agn_coord, star_coords, used_files):
+def plot_fits_footprints(agn_coord, star_coords, used_files, savename=None):
     fig, ax = plt.subplots(figsize=(8, 6))
 
     for filename in used_files:
@@ -84,6 +84,8 @@ def plot_fits_footprints(agn_coord, star_coords, used_files):
     ax.grid(True)
     ax.xaxis.set_inverted(True)
     plt.tight_layout()
+    if savename: 
+        plt.savefig(savename)
     plt.show()
     
 def sigma_clipped_std(arr, sigma=3.0, max_iter=5):
@@ -123,7 +125,7 @@ def sigma_clipped_std(arr, sigma=3.0, max_iter=5):
 
 def asinhstretch(im): return np.arcsinh(im/sigma_clipped_stats(im[np.isfinite(im)])[2])
 
-def simple_grid_plot(cutouts, stretch=True):
+def simple_grid_plot(cutouts, stretch=True, filename=None):
     ny = int(np.sqrt(len(cutouts)-1))+1
     nx = (len(cutouts)-1)//ny+1
     fig, axs = plt.subplots(nx, ny, figsize=(12, 12))
@@ -136,6 +138,9 @@ def simple_grid_plot(cutouts, stretch=True):
             axs[i].imshow(cutout, origin='lower', vmin=0, vmax=np.nanmax(cutout)/5)
         axs[i].axis('off')
         axs[i].set_title(i, size=15)
+    if filename: 
+        plt.savefig(filename)
+    plt.show()
 
 #%% --------------------------------------------------------------------------
 
@@ -392,6 +397,8 @@ class PSFFitter(ImagesFitter):
             residual = models - this_cutouts # [N, h, w]
             # loss = torch.sum(residual * residual) # 标量
             residual_loss = torch.sum(torch.abs(residual))
+            if '_loss' not in self.config:
+                self.config['_loss'] = {'residual': 1, 'sigma': 1}
             residual_wt = self.config['_loss']['residual']
             loss += residual_loss*residual_wt
             
@@ -553,3 +560,4 @@ class SpikesRemover(PSFFitter):
 
         return loss
 
+xw
