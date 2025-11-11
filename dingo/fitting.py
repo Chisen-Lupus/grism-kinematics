@@ -149,7 +149,8 @@ def build_param_config_dict_with_alias(
         'image': {'dx', 'dy'},
         'sersic': {'I_e', 'R_e', 'n', 'x0', 'y0', 'q', 'theta'}, 
         'psf': {'I_psf', 'x_psf', 'y_psf'}, 
-        'direct': {'dx', 'dy', 'wt', 'zp'} # TODO: change image to grism and alas to direct??
+        'direct': {'dx', 'dy', 'wt', 'zp'}, # TODO: change image to grism and alas to direct?? TODO: change 'wt' to 'zp'
+        'psfs': {'scale', 'zp'} # TODO: change image to grism and alas to direct??
         # TODO: move this part out
     }
     if allowed_keys_extra: 
@@ -740,6 +741,20 @@ class ImagesFitter(BaseFitter):
                 )
                 self.direct_cfgs_lists[iid] = i_cfgs
 
+        # add psf params
+        # NOTE: overrides will be mutated during iteration
+        for filter, psfs_cfg in self.config['psfs'].items():
+            for iid, raw_dict in psfs_cfg.items():
+                psf_cfgs = build_param_config_dict_with_alias(
+                    raw_dict=raw_dict,
+                    default_cfgs=defaults,
+                    overrides_list=overrides,
+                    prefix=f'psfs.{filter}.{iid}',
+                    all_cfgs=_all_cfgs,
+                    device=self.device
+                )
+                self.direct_cfgs_lists[iid] = psf_cfgs
+
         # add sersic params
         for cid, raw_dict in self.config['sersic'].items():
             s_cfgs = build_param_config_dict_with_alias(
@@ -752,7 +767,7 @@ class ImagesFitter(BaseFitter):
             )
             self.sersic_cfgs_lists[cid] = s_cfgs
 
-        # add psf params
+        # add point source params
         for cid, raw_dict in self.config['psf'].items():
             p_cfgs = build_param_config_dict_with_alias(
                 raw_dict=raw_dict,
@@ -783,8 +798,12 @@ class ImagesFitter(BaseFitter):
         # construct true image per psf
         for filter in self.all_filters:
             for pid, psf_info in self.psfs[filter].items():
-                # print(psf_info)
-                psf_tensor = psf_info['psf']
+                # TODO: change pid name?
+                psf_params = self._get_model_params(pid)
+                psf_scale = psf_params['scale']
+                psf_zp = psf_params['zp']
+                psf_tensor = (psf_info['psf'] - psf_zp) / psf_scale
+                
                 img_list = psf_info['image_map']
 
                 # compute psf-level sampled model at this filter
@@ -792,6 +811,7 @@ class ImagesFitter(BaseFitter):
                 model = 0
 
                 psf_cid_list = self.config['psf'].keys()
+                # TODO: change psf here to ps
                 for psf_cid in psf_cid_list: 
                     psf_params = self._get_model_params(psf_cid)
                     psf_model = model + galaxy.full_psf_model_torch(
@@ -922,7 +942,11 @@ class ImagesFitter(BaseFitter):
         direct_info = self.direct_images[filter][iid]
         pid = direct_info['pid']
         psf_info = self.psfs[filter][pid]
-        psf_tensor = psf_info['psf']
+        psf_params = self._get_model_params(pid)
+        psf_scale = psf_params['scale']
+        psf_zp = psf_params['zp']
+        psf_tensor = (psf_info['psf'] - psf_zp) / psf_scale
+        
         this_image = direct_info['image']
         factor = psf_info['oversample']//direct_info['oversample']
         direct_params = self._get_model_params(iid)
