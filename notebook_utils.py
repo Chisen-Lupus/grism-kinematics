@@ -467,7 +467,8 @@ class SpikesRemover(PSFFitter):
             zps = torch.stack(zps)
             scales = torch.stack(scales)
             # normalize centroids
-            centroids -= torch.mean(centroids, dim=0)
+            # XXX: temporarily remove this
+            # centroids -= torch.mean(centroids, dim=0)
             zps -= torch.mean(zps)
 
             # compute psf-level sampled model at this filter
@@ -559,5 +560,3 @@ class SpikesRemover(PSFFitter):
             self.combined_err_full[filter] = combined_err_full
 
         return loss
-
-xw

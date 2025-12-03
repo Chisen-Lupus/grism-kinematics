@@ -206,9 +206,10 @@ def _extract_tensors(cfgs: Dict[str, FitParamConfig], device: torch.device = 'cp
     return tensors, clamp_list
 
 def load_fits_data(path_hdu):
-    path, hdu_index = path_hdu
+    '''the slice syntax is capable for both hdu index and hdu name'''
+    path, hdu = path_hdu
     with fits.open(path) as hdulist:
-        return np.array(hdulist[hdu_index].data, dtype=np.float32)
+        return np.array(hdulist[hdu].data, dtype=np.float32)
 
 #%% --------------------------------------------------------------------------
 # generic base class for all fitters
@@ -695,22 +696,33 @@ class ImagesFitter(BaseFitter):
                 self.psfs[filter][pid]['image_map'].append(iid)
                 # add image data
                 img_data = load_fits_data(img_cfg['path'])
+                try: 
+                    err_data = load_fits_data([img_cfg['path'][0], 'ERR'])
+                except: 
+                    LOG.warning(f'No err image for {img_cfg['path']}')
+                    err_data = np.ones_like(img_data)
                 if '_cutout' in img_cfg: 
                     x, y, dx, dy = img_cfg['_cutout']
                     img_data = img_data[x:x+dx, y:y+dy]
                 img_tensor = torch.tensor(
                     img_data, dtype=torch.float32, device=self.device
                 )
+                err_tensor = torch.tensor(
+                    err_data, dtype=torch.float32, device=self.device
+                )
                 direct_info = {}
                 direct_info['pid'] = pid
                 direct_info['image'] = img_tensor
+                direct_info['err'] = err_tensor
                 direct_info['oversample'] = img_cfg['oversample']
                 if self.psfs[filter][pid]['oversample']<direct_info['oversample']: 
                     raise ValueError('PSF is not well-sampled!')
                 self.direct_images[filter][iid] = direct_info
 
         # 2) Grid # TODO: specify for each filter??
-        self.nx, self.ny = self.r_fit*2+1, self.r_fit*2+1
+        # XXX: temporary solution for 2x dither
+        self.nx, self.ny = img_data.shape
+        # self.nx, self.ny = self.r_fit*2+1, self.r_fit*2+1
         self.yy, self.xx = torch.meshgrid(
             torch.linspace(0, self.nx-1, self.nx, device=self.device),
             torch.linspace(0, self.ny-1, self.ny, device=self.device),
@@ -814,7 +826,7 @@ class ImagesFitter(BaseFitter):
                 # TODO: change psf here to ps
                 for psf_cid in psf_cid_list: 
                     psf_params = self._get_model_params(psf_cid)
-                    psf_model = model + galaxy.full_psf_model_torch(
+                    psf_model = galaxy.full_psf_model_torch(
                         self.nx, self.ny, psf_tensor, **psf_params
                     )
                     model += psf_model
@@ -832,9 +844,11 @@ class ImagesFitter(BaseFitter):
                 for iid in img_list: 
                     direct_info = self.direct_images[filter][iid]
                     this_image = direct_info['image']
+                    this_err = direct_info['err']
                     factor = psf_info['oversample']//direct_info['oversample']
                     direct_params = self._get_model_params(iid)
                     nx, ny = this_image.shape
+                    # TODO: change wt to scale and scale err as well
                     dx, dy, wt, zp = direct_params.values()
 
                     # this_model = utils.downsample_with_shift_and_size(
@@ -850,17 +864,22 @@ class ImagesFitter(BaseFitter):
                     this_model_hat = utils.fft_bin(this_combined_image_hat, oversample)
                     this_model = torch.fft.ifft2(this_model_hat).real
 
-                    # this_image = (this_image - zp)*wt
-                    this_image = (this_image - zp)/wt
+                    # this_image = (this_image - zp)/wt
                     # res = this_image - this_model - offset
                     res = this_image - this_model
-                    # this_loss = torch.sum((this_model - this_image)**2)
-                    this_loss = torch.sum(torch.abs((res)))
-                    # print(torch.sum(torch.abs(this_image)))
-                    # raise RuntimeError
-                    # neg_loss = torch.sum(torch.abs(res[res<0]))*1000
-                    # loss += neg_loss
-                    loss += this_loss
+                    # residual loss ------
+                    res_loss = torch.sum((this_model - this_image)**2)
+                    # res_loss = torch.sum(torch.abs((res)))
+                    # loss += res_loss
+                    # chi2 loss ------
+                    # this_err[~torch.isfinite(this_err)] = 1
+                    finite_mask = torch.isfinite(this_err)
+                    # chi2_loss = torch.nansum(torch.abs(res[finite_mask]/this_err[finite_mask]))
+                    # Cauchy loss（Robust χ²）
+                    c = 2.0
+                    # chi2_loss = torch.nansum(torch.log(1 + (res[finite_mask]/this_err[finite_mask])**2 / c**2))
+                    chi2_loss = torch.nansum((res[finite_mask]/this_err[finite_mask])**2)
+                    loss += chi2_loss
 
         return loss
     
