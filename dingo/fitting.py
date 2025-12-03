@@ -67,10 +67,15 @@ class FitParamConfig:
         device: torch.device = 'cpu'
     ):
         self.name = name
-        self.tensor = torch.tensor(ensure_float_like(value), requires_grad=fit, device=device)
+        try:
+            self.tensor = torch.tensor(ensure_float_like(value), requires_grad=fit, device=device)
+            self.min = torch.tensor(ensure_float_like(min), dtype=self.tensor.dtype, device=device)
+            self.max = torch.tensor(ensure_float_like(max), dtype=self.tensor.dtype, device=device)
+        except TypeError:
+            self.tensor = value
+            self.min = min
+            self.max = max
         self.lr = lr
-        self.min = torch.tensor(ensure_float_like(min), dtype=self.tensor.dtype, device=device)
-        self.max = torch.tensor(ensure_float_like(max), dtype=self.tensor.dtype, device=device)
         # Store the “real” fit‐flag in a private variable:
         self._fit = bool(fit)
 
@@ -93,7 +98,10 @@ class FitParamConfig:
         '''
         Always return a NumPy array (or scalar) extracted from self.tensor.
         '''
-        return self.tensor.cpu().detach().numpy()
+        try:
+            return self.tensor.cpu().detach().numpy()
+        except AttributeError:
+            return repr(self.tensor)
 
     @property
     def fit(self) -> bool:
@@ -558,6 +566,16 @@ class KinematicsFitter(BaseFitter):
                 lr=0, min=0, max=0, fit=False
             )
             cfg['image.C.forward_model'].tensor = self.fwd_models['C']
+        print(self.dispersion_C_cfg_list)
+
+        self.model_cfg = {'result.emline_model': FitParamConfig(
+            name='result.emline_model',
+            value = np.ones((81, 81))/np.sum(self.true_grism_R.numpy()),
+            lr = 0.05,
+            min=0, 
+            max=1e10, 
+            fit=True
+        )}
 
         if len(overrides)>0: 
             unused_keys = set([key for stage in overrides for key in stage.keys()])
@@ -568,6 +586,7 @@ class KinematicsFitter(BaseFitter):
             'velocity':       self.velocity_cfg_list,
             'dispersion_R':   self.dispersion_R_cfg_list,
             'dispersion_C':   self.dispersion_C_cfg_list,
+            'model':          [self.model_cfg]
         }
 
         # ─────────────────────────────
@@ -621,17 +640,26 @@ class KinematicsFitter(BaseFitter):
         self.image_C = kinematics.bilinear_interpolte_intensity_torch(
             self.x_C, self.y_C, self.true_grism_C, self.cutout_C
         )
+        
+        # emline_model = self._get_model_params('model')['emline_model']
+        # # return torch.sum((self.image_R/torch.sum(self.image_R) - emline_model/torch.sum(emline_model))**2) + \
+        # #        torch.sum((self.image_C/torch.sum(self.image_C) - emline_model/torch.sum(emline_model))**2)
+        
+        # return torch.sum((self.image_R - emline_model)**2) + torch.sum((self.image_C - emline_model)**2)
 
         # L2 loss between the two grism channels
         return torch.sum((self.image_R - self.image_C)**2)
 
-    def _log(self, i: int, loss: torch.Tensor):
-        # preserve original xy_iters logging
-        if i == 0 or (i+1) % 500 == 0:
+    def _log(self, i: int, loss: torch.Tensor, cadence: int=500):
+        '''
+        Default logging hook: logs stage, step, loss, and lr.
+        Subclasses can override to include extra info (e.g. xy_iters).
+        '''
+        if i == 0 or (i+1) % cadence == 0:
             LOG.info(
                 f'Stage {self.current_stage+1}, '
-                f'Step {i+1}, loss={loss.item():.3f}, '
-                f'lr={self.optimizer.param_groups[0]['lr']:.5f}, '
+                f'Step {i+1}, loss={loss.item():.5g}, '
+                f'lr={self.optimizer.param_groups[0]['lr']:.5f}'
                 f'xy_iters={(self.iter_R, self.iter_C)}'
             )
 

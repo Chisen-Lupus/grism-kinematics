@@ -54,13 +54,15 @@ def plot_kinematics_fitting_result(true_im, model_im, vz, diff_im, title_prefix,
     im0 = axs_row[0].imshow(true_im)
     axs_row[0].set_title(f'{title_prefix} Grism Image')
     axs_row[0].grid(False)
-    axs_row[0].scatter(x0_v-dx, y0_v-dy, marker='o', s=100, c='none', edgecolor='lime')
+    # axs_row[0].scatter(x0_v-dx, y0_v-dy, marker='o', s=100, c='none', edgecolor='lime')
+    axs_row[0].scatter(x0_v-dx, y0_v-dy, marker='+', s=100, c='lime')
     plt.colorbar(im0, ax=axs_row[0], fraction=0.046, pad=0.04)
 
     im1 = axs_row[1].imshow(model_im)
     axs_row[1].set_title(f'{title_prefix} velocity corrected')
     axs_row[1].grid(False)
-    axs_row[1].scatter(x0_v, y0_v, marker='o', s=100, c='none', edgecolor='lime')
+    # axs_row[1].scatter(x0_v, y0_v, marker='o', s=100, c='none', edgecolor='lime')
+    axs_row[1].scatter(x0_v, y0_v, marker='+', s=100, c='lime')
     plt.colorbar(im1, ax=axs_row[1], fraction=0.046, pad=0.04)
 
     im2 = axs_row[2].imshow(residual, cmap='seismic', vmin=-resid_max, vmax=resid_max)
