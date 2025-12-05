@@ -343,6 +343,7 @@ def bilinear_shift_psf_torch(psf, dx, dy):
 
 def insert_shifted_psf_into_frame(psf, x0, y0, nx, ny):
     """
+    # NOTE: note used for now
     Create an (ny, nx) image with the PSF centered at subpixel location (x0, y0).
 
     Parameters
@@ -513,6 +514,44 @@ def fft_bin(ps, n):
 
     return c_hat/n**2
 
+# def fft_phase_shift(F, dx, dy):
+#     """
+#     Shift a 2D image by (dx, dy) using FFT phase shift.
+
+#     Parameters
+#     ----------
+#     F : torch.Tensor
+#         2D tensor (H, W), assumed float32 or float64.
+#     dx, dy : float
+#         Subpixel shifts in x (columns) and y (rows).
+
+#     Returns
+#     -------
+#     torch.Tensor
+#         Shifted image of same shape.
+#     """
+#     H, W = F.shape
+#     device = F.device
+#     dtype = F.dtype
+
+#     # Frequencies in cycles per pixel (normalized)
+#     fx = torch.fft.fftfreq(W, d=1.0).to(device=device, dtype=dtype)
+#     fy = torch.fft.fftfreq(H, d=1.0).to(device=device, dtype=dtype)
+
+#     # Meshgrid of frequencies
+#     v, u = torch.meshgrid(fy, fx, indexing='ij')  # (H, W)
+
+#     # Apply phase shift
+#     phase_shift = torch.exp(-2j * torch.pi * (u * dx + v * dy))
+#     F_shifted = F * phase_shift
+
+#     return F_shifted
+
+_FFT_PHASE_GRID_CACHE = {}
+
+
+
+
 def fft_phase_shift(F, dx, dy):
     """
     Shift a 2D image by (dx, dy) using FFT phase shift.
@@ -520,8 +559,8 @@ def fft_phase_shift(F, dx, dy):
     Parameters
     ----------
     F : torch.Tensor
-        2D tensor (H, W), assumed float32 or float64.
-    dx, dy : float
+        2D tensor (H, W), assumed float32 or float64 (real) or complex.
+    dx, dy : float or 0D tensor
         Subpixel shifts in x (columns) and y (rows).
 
     Returns
@@ -533,15 +572,27 @@ def fft_phase_shift(F, dx, dy):
     device = F.device
     dtype = F.dtype
 
-    # Frequencies in cycles per pixel (normalized)
-    fx = torch.fft.fftfreq(W, d=1.0).to(device=device, dtype=dtype)
-    fy = torch.fft.fftfreq(H, d=1.0).to(device=device, dtype=dtype)
+    # 保证 dx,dy 是标量 tensor，方便广播
+    dx = torch.as_tensor(dx, device=device, dtype=torch.float64)
+    dy = torch.as_tensor(dy, device=device, dtype=torch.float64)
 
-    # Meshgrid of frequencies
-    v, u = torch.meshgrid(fy, fx, indexing='ij')  # (H, W)
+    # 准备/缓存频率网格（只依赖 H,W,device）
+    key = (H, W, device)
+    if key in _FFT_PHASE_GRID_CACHE:
+        fy, fx = _FFT_PHASE_GRID_CACHE[key]
+    else:
+        fx = torch.fft.fftfreq(W, d=1.0).to(device=device, dtype=torch.float64)
+        fy = torch.fft.fftfreq(H, d=1.0).to(device=device, dtype=torch.float64)
+        fy, fx = torch.meshgrid(fy, fx, indexing='ij')  # (H, W)
+        _FFT_PHASE_GRID_CACHE[key] = (fy, fx)
 
-    # Apply phase shift
-    phase_shift = torch.exp(-2j * torch.pi * (u * dx + v * dy))
-    F_shifted = F * phase_shift
+    # 构造相位因子（用 double 保精度，最后 cast 回原 dtype）
+    phase = torch.exp(-2j*torch.pi*(fx*dx + fy*dy))  # complex128
+    if not torch.is_complex(F):
+        F = F.to(torch.complex64 if dtype==torch.float32 else torch.complex128)
+    F_shifted = F*phase.to(F.dtype)
 
     return F_shifted
+
+
+

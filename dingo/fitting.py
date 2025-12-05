@@ -747,15 +747,25 @@ class ImagesFitter(BaseFitter):
                     raise ValueError('PSF is not well-sampled!')
                 self.direct_images[filter][iid] = direct_info
 
-        # 2) Grid # TODO: specify for each filter??
-        # XXX: temporary solution for 2x dither
-        self.nx, self.ny = img_data.shape
-        # self.nx, self.ny = self.r_fit*2+1, self.r_fit*2+1
-        self.yy, self.xx = torch.meshgrid(
-            torch.linspace(0, self.nx-1, self.nx, device=self.device),
-            torch.linspace(0, self.ny-1, self.ny, device=self.device),
-            indexing='ij'
-        )
+        # 2) Per-image grids: self.grids[filter][iid]
+        self.grids = {}  # {filter: {iid: {'nx', 'ny', 'xx', 'yy'}}}
+
+        for filter, imgs in self.direct_images.items():
+            self.grids[filter] = {}
+            for iid, direct_info in imgs.items():
+                img = direct_info['image']
+                nx, ny = img.shape
+                yy, xx = torch.meshgrid(
+                    torch.linspace(0, nx-1, nx, device=self.device),
+                    torch.linspace(0, ny-1, ny, device=self.device),
+                    indexing='ij'
+                )
+                self.grids[filter][iid] = {
+                    'nx': nx,
+                    'ny': ny,
+                    'xx': xx,
+                    'yy': yy,
+                }
 
         # 3) Defaults & overrides
         defaults = [fs['default'] for fs in self.config['fitting']]
@@ -838,54 +848,52 @@ class ImagesFitter(BaseFitter):
         # construct true image per psf
         for filter in self.all_filters:
             for pid, psf_info in self.psfs[filter].items():
-                # TODO: change pid name?
-                psf_params = self._get_model_params(pid)
-                psf_scale = psf_params['scale']
-                psf_zp = psf_params['zp']
+                # 全局 psf 标定（scale / zp）
+                psf_params_global = self._get_model_params(pid)
+                psf_scale = psf_params_global['scale']
+                psf_zp = psf_params_global['zp']
                 psf_tensor = (psf_info['psf'] - psf_zp) / psf_scale
                 
                 img_list = psf_info['image_map']
 
-                # compute psf-level sampled model at this filter
-
-                model = 0
-
-                psf_cid_list = self.config['psf'].keys()
-                # TODO: change psf here to ps
-                for psf_cid in psf_cid_list: 
-                    psf_params = self._get_model_params(psf_cid)
-                    psf_model = galaxy.full_psf_model_torch(
-                        self.nx, self.ny, psf_tensor, **psf_params
-                    )
-                    model += psf_model
-                
-                sersic_cid_list = self.config['sersic'].keys()
-                for sersic_cid in sersic_cid_list: 
-                    sersic_params = self._get_model_params(sersic_cid)
-                    sersic_model = galaxy.full_sersic_model_torch(
-                        self.xx, self.yy, psf_tensor, **sersic_params
-                    )
-                    model += sersic_model
-
-                # downsample to each image and compute loss
-
-                for iid in img_list: 
+                for iid in img_list:
+                    # ----- 该 iid 的数据和 grid -----
                     direct_info = self.direct_images[filter][iid]
                     this_image = direct_info['image']
                     this_err = direct_info['err']
+                    nx_img, ny_img = this_image.shape
+
+                    grid = self.grids[filter][iid]
+                    xx, yy = grid['xx'], grid['yy']
+
                     factor = psf_info['oversample']//direct_info['oversample']
                     direct_params = self._get_model_params(iid)
-                    nx, ny = this_image.shape
-                    # TODO: change wt to scale and scale err as well
                     dx, dy, wt, zp = direct_params.values()
 
-                    # this_model = utils.downsample_with_shift_and_size(
-                    #     x=model, factor=factor, out_size=(nx, ny), shift=(dx, dy), 
-                    # )
+                    # ----- 在该 iid 的网格上构建 oversampled model -----
+                    model = 0
+
+                    psf_cid_list = self.config['psf'].keys()
+                    for psf_cid in psf_cid_list:
+                        psf_params = self._get_model_params(psf_cid)
+                        psf_model = galaxy.full_psf_model_torch(
+                            xx, yy, psf_tensor, **psf_params
+                        )
+                        model += psf_model
+
+                    sersic_cid_list = self.config['sersic'].keys()
+                    for sersic_cid in sersic_cid_list:
+                        sersic_params = self._get_model_params(sersic_cid)
+                        sersic_model = galaxy.full_sersic_model_torch(
+                            xx, yy, psf_tensor, **sersic_params
+                        )
+                        model += sersic_model
+
+                    # ----- 下采样 + shift + loss（基本保持原来的逻辑） -----
                     oversample = factor
                     combined_image_hat = torch.fft.fft2(model)
                     this_combined_image_hat = utils.fft_phase_shift(
-                        combined_image_hat, 
+                        combined_image_hat,
                         dy*oversample,
                         dx*oversample
                     )
@@ -989,9 +997,9 @@ class ImagesFitter(BaseFitter):
         direct_info = self.direct_images[filter][iid]
         pid = direct_info['pid']
         psf_info = self.psfs[filter][pid]
-        psf_params = self._get_model_params(pid)
-        psf_scale = psf_params['scale']
-        psf_zp = psf_params['zp']
+        psf_params_global = self._get_model_params(pid)
+        psf_scale = psf_params_global['scale']
+        psf_zp = psf_params_global['zp']
         psf_tensor = (psf_info['psf'] - psf_zp) / psf_scale
         
         this_image = direct_info['image']
@@ -1000,30 +1008,31 @@ class ImagesFitter(BaseFitter):
         nx, ny = this_image.shape
         dx, dy, _, _ = direct_params.values()
 
-        # compute models and downsample
+        grid = self.grids[filter][iid]
+        xx, yy = grid['xx'], grid['yy']
 
         psf_models = {}
         sersic_models = {}
 
         psf_cid_list = self.config['psf'].keys()
-        for psf_cid in psf_cid_list: 
+        for psf_cid in psf_cid_list:
             psf_params = self._get_model_params(psf_cid)
             psf_model = galaxy.full_psf_model_torch(
-                self.nx, self.ny, psf_tensor, **psf_params
+                xx, yy, psf_tensor, **psf_params
             )
             this_component = utils.downsample_with_shift_and_size(
-                x=psf_model, factor=factor, out_size=(nx, ny), shift=(dx, dy), 
+                x=psf_model, factor=factor, out_size=(nx, ny), shift=(dx, dy),
             )
             psf_models[psf_cid] = this_component.detach().cpu().numpy()
         
         sersic_cid_list = self.config['sersic'].keys()
-        for sersic_cid in sersic_cid_list: 
+        for sersic_cid in sersic_cid_list:
             sersic_params = self._get_model_params(sersic_cid)
             sersic_model = galaxy.full_sersic_model_torch(
-                self.xx, self.yy, psf_tensor, **sersic_params
+                xx, yy, psf_tensor, **sersic_params
             )
             this_component = utils.downsample_with_shift_and_size(
-                x=sersic_model, factor=factor, out_size=(nx, ny), shift=(dx, dy), 
+                x=sersic_model, factor=factor, out_size=(nx, ny), shift=(dx, dy),
             )
             sersic_models[sersic_cid] = this_component.detach().cpu().numpy()
         
@@ -1079,7 +1088,11 @@ class ImagesFitter(BaseFitter):
         
         psf_info = self.psfs[filter][pid]
         psf_tensor = psf_info['psf']
-        # compute models and downsample
+
+        # 这里没有 iid，只需挑一个 iid 来拿 grid（假设同一个 filter+pid 下各 iid 尺寸相同）
+        iid0 = psf_info['image_map'][0]
+        grid = self.grids[filter][iid0]
+        xx, yy = grid['xx'], grid['yy']
 
         psf_models = {}
         sersic_models = {}
@@ -1088,7 +1101,7 @@ class ImagesFitter(BaseFitter):
         for psf_cid in psf_cid_list: 
             psf_params = self._get_model_params(psf_cid)
             psf_model = galaxy.full_psf_model_torch(
-                self.nx, self.ny, psf_tensor, **psf_params
+                xx, yy, psf_tensor, **psf_params
             )
             psf_models[psf_cid] = psf_model.detach().cpu().numpy()
         
@@ -1096,7 +1109,7 @@ class ImagesFitter(BaseFitter):
         for sersic_cid in sersic_cid_list: 
             sersic_params = self._get_model_params(sersic_cid)
             sersic_model = galaxy.full_sersic_model_torch(
-                self.xx, self.yy, psf_tensor, **sersic_params
+                xx, yy, psf_tensor, **sersic_params
             )
             sersic_models[sersic_cid] = sersic_model.detach().cpu().numpy()
         
