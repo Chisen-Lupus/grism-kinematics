@@ -774,6 +774,7 @@ class ImagesFitter(BaseFitter):
         # 4) Raw params
         _all_cfgs = [{} for _ in range(len(self.config['fitting']))]  # temp cfg for matching alias
         self.direct_cfgs_lists = {}
+        self.psfs_cfgs_lists = {}
         self.sersic_cfgs_lists = {}
         self.psf_cfgs_lists = {}
 
@@ -781,60 +782,71 @@ class ImagesFitter(BaseFitter):
         # NOTE: overrides will be mutated during iteration
         for filter, imgs_cfg in self.config['direct'].items():
             for iid, raw_dict in imgs_cfg.items():
+                prefix = f'direct.{filter}.{iid}'  # 统一用点
                 i_cfgs = build_param_config_dict_with_alias(
                     raw_dict=raw_dict,
                     default_cfgs=defaults,
                     overrides_list=overrides,
-                    prefix=f'direct.{filter}.{iid}',
+                    prefix=prefix,
                     all_cfgs=_all_cfgs,
                     device=self.device
                 )
-                self.direct_cfgs_lists[iid] = i_cfgs
+                self.direct_cfgs_lists[prefix] = i_cfgs
 
         # add psf params
         # NOTE: overrides will be mutated during iteration
         for filter, psfs_cfg in self.config['psfs'].items():
-            for iid, raw_dict in psfs_cfg.items():
+            for pid, raw_dict in psfs_cfg.items():
+                prefix = f'psfs.{filter}.{pid}'  # e.g. psfs.f115w.psf0
                 psf_cfgs = build_param_config_dict_with_alias(
                     raw_dict=raw_dict,
                     default_cfgs=defaults,
                     overrides_list=overrides,
-                    prefix=f'psfs.{filter}.{iid}',
+                    prefix=prefix,
                     all_cfgs=_all_cfgs,
                     device=self.device
                 )
-                self.direct_cfgs_lists[iid] = psf_cfgs
+                self.psfs_cfgs_lists[prefix] = psf_cfgs
 
         # add sersic params
-        for cid, raw_dict in self.config['sersic'].items():
-            s_cfgs = build_param_config_dict_with_alias(
-                raw_dict=raw_dict,
-                default_cfgs=defaults,
-                overrides_list=overrides,
-                prefix=f'sersic.{cid}',
-                all_cfgs=_all_cfgs, 
-                device=self.device
-            )
-            self.sersic_cfgs_lists[cid] = s_cfgs
+        for cid, per_filter_dict in self.config['psf'].items():
+            for filter_name, raw_dict in per_filter_dict.items():   # per_filter_dict: {'f115w': {...}, ...}
+                prefix = f'psf.{cid}.{filter_name}'                 # e.g. psf.p0.f115w
+                p_cfgs = build_param_config_dict_with_alias(
+                    raw_dict=raw_dict,
+                    default_cfgs=defaults,
+                    overrides_list=overrides,
+                    prefix=prefix,
+                    all_cfgs=_all_cfgs,
+                    device=self.device
+                )
+                self.psf_cfgs_lists[prefix] = p_cfgs
 
         # add point source params
-        for cid, raw_dict in self.config['psf'].items():
-            p_cfgs = build_param_config_dict_with_alias(
-                raw_dict=raw_dict,
-                default_cfgs=defaults,
-                overrides_list=overrides,
-                prefix=f'psf.{cid}',
-                all_cfgs=_all_cfgs, 
-                device=self.device
-            )
-            self.psf_cfgs_lists[cid] = p_cfgs
+        for cid, per_filter_dict in self.config['sersic'].items():
+            for filter_name, raw_dict in per_filter_dict.items():
+                prefix = f'sersic.{cid}.{filter_name}'              # sersic.s0.f115w
+                s_cfgs = build_param_config_dict_with_alias(
+                    raw_dict=raw_dict,
+                    default_cfgs=defaults,
+                    overrides_list=overrides,
+                    prefix=prefix,
+                    all_cfgs=_all_cfgs, 
+                    device=self.device
+                )
+                self.sersic_cfgs_lists[prefix] = s_cfgs
 
         if len(overrides)>0: 
             unused_keys = set([key for stage in overrides for key in stage.keys()])
             LOG.warning(f'The following override keys are not used: {unused_keys}')
 
         # 5) Register
-        self.param_config_lists = self.psf_cfgs_lists | self.sersic_cfgs_lists | self.direct_cfgs_lists
+        self.param_config_lists = (
+            self.psfs_cfgs_lists
+            | self.psf_cfgs_lists
+            | self.sersic_cfgs_lists
+            | self.direct_cfgs_lists
+        )
 
         # extra_cfg_lists = {'extra': [{'extra.offset': FitParamConfig(name='extra.offset', value=0, lr=0.0001, min=-1e10, max=1e10, fit=True )}]}
         # self.param_config_lists = self.param_config_lists | extra_cfg_lists
@@ -849,7 +861,8 @@ class ImagesFitter(BaseFitter):
         for filter in self.all_filters:
             for pid, psf_info in self.psfs[filter].items():
                 # 全局 psf 标定（scale / zp）
-                psf_params_global = self._get_model_params(pid)
+                psf_group = f'psfs.{filter}.{pid}'              # instrument PSF 的 param config id
+                psf_params_global = self._get_model_params(psf_group)
                 psf_scale = psf_params_global['scale']
                 psf_zp = psf_params_global['zp']
                 psf_tensor = (psf_info['psf'] - psf_zp) / psf_scale
@@ -867,23 +880,24 @@ class ImagesFitter(BaseFitter):
                     xx, yy = grid['xx'], grid['yy']
 
                     factor = psf_info['oversample']//direct_info['oversample']
-                    direct_params = self._get_model_params(iid)
+                    direct_group = f'direct.{filter}.{iid}'
+                    direct_params = self._get_model_params(direct_group)
                     dx, dy, wt, zp = direct_params.values()
 
                     # ----- 在该 iid 的网格上构建 oversampled model -----
                     model = 0
 
-                    psf_cid_list = self.config['psf'].keys()
+                    psf_cid_list = self.config['psf'].keys()   # ['p0', 'p1', ...]
                     for psf_cid in psf_cid_list:
-                        psf_params = self._get_model_params(psf_cid)
-                        psf_model = galaxy.full_psf_model_torch(
-                            xx, yy, psf_tensor, **psf_params
-                        )
+                        psf_group = f'psf.{psf_cid}.{filter}' # e.g. psf.p0.f115w
+                        psf_params = self._get_model_params(psf_group)
+                        psf_model = galaxy.full_psf_model_torch(xx, yy, psf_tensor, **psf_params)
                         model += psf_model
 
                     sersic_cid_list = self.config['sersic'].keys()
                     for sersic_cid in sersic_cid_list:
-                        sersic_params = self._get_model_params(sersic_cid)
+                        sersic_group = f'sersic.{sersic_cid}.{filter}'
+                        sersic_params = self._get_model_params(sersic_group)
                         sersic_model = galaxy.full_sersic_model_torch(
                             xx, yy, psf_tensor, **sersic_params
                         )
@@ -975,67 +989,100 @@ class ImagesFitter(BaseFitter):
         return true_images
 
     def get_fitted_component(self, filter=None, iid=None):
-        '''
+        """
         Reconstruct the fitted models (sum of PSF and/or Sérsic components)
-        and return it as a NumPy array.
+        and return them as NumPy arrays on the *downsampled* data grid
+        for a given (filter, iid).
 
         Parameters
         ----------
-        filter: str
-            The Filter of the model to be returned. Default to be the first item
-        iid: str
-            The Image ID of the model to be returned. Default to be the first item
-        '''
+        filter : str, optional
+            Filter name. If None, use the first filter in self.direct_images.
+        iid : str, optional
+            Image ID within that filter. If None, use the first iid for that filter.
 
-        if not filter: 
+        Returns
+        -------
+        sersic_models : dict
+            {sersic_cid: 2D ndarray} on the data image grid.
+        psf_models : dict
+            {psf_cid: 2D ndarray} on the data image grid.
+        """
+
+        # ----- 1) choose default filter / iid -----
+        if filter is None:
             filter = next(iter(self.direct_images.keys()))
-        if not iid: 
+        if iid is None:
             iid = next(iter(self.direct_images[filter].keys()))
 
-        # image-specifig configs
-        
+        # ----- 2) image & PSF info -----
         direct_info = self.direct_images[filter][iid]
-        pid = direct_info['pid']
-        psf_info = self.psfs[filter][pid]
-        psf_params_global = self._get_model_params(pid)
-        psf_scale = psf_params_global['scale']
-        psf_zp = psf_params_global['zp']
+        pid = direct_info['pid']                   # e.g. "psf0"
+        psf_info = self.psfs[filter][pid]          # instrument PSF for this filter
+
+        # instrument PSF 标定参数：psfs.<filter>.<pid>.*
+        psfs_group = f'psfs.{filter}.{pid}'        # e.g. "psfs.f115w.psf0"
+        psfs_params = self._get_model_params(psfs_group)
+        psf_scale = psfs_params['scale']
+        psf_zp = psfs_params['zp']
+
+        # 归一化 / 零点校正后的 PSF kernel
         psf_tensor = (psf_info['psf'] - psf_zp) / psf_scale
-        
+
+        # 该 iid 的数据与 grid
         this_image = direct_info['image']
-        factor = psf_info['oversample']//direct_info['oversample']
-        direct_params = self._get_model_params(iid)
         nx, ny = this_image.shape
-        dx, dy, _, _ = direct_params.values()
+        factor = psf_info['oversample'] // direct_info['oversample']
 
         grid = self.grids[filter][iid]
         xx, yy = grid['xx'], grid['yy']
 
+        # direct.<filter>.<iid>.*
+        direct_group = f'direct.{filter}.{iid}'
+        direct_params = self._get_model_params(direct_group)
+        dx = direct_params['dx']
+        dy = direct_params['dy']
+        # wt = direct_params['wt']
+        # zp = direct_params['zp']
+
+        # ----- 3) 逐 component 生成 oversampled model，再 downsample -----
         psf_models = {}
         sersic_models = {}
 
-        psf_cid_list = self.config['psf'].keys()
-        for psf_cid in psf_cid_list:
-            psf_params = self._get_model_params(psf_cid)
-            psf_model = galaxy.full_psf_model_torch(
+        # 3a) galaxy PSF components: psf.<cid>.<filter>.*
+        for psf_cid in self.config['psf'].keys():
+            psf_group = f'psf.{psf_cid}.{filter}'     # e.g. "psf.p0.f115w"
+            psf_params = self._get_model_params(psf_group)
+
+            psf_model_oversampled = galaxy.full_psf_model_torch(
                 xx, yy, psf_tensor, **psf_params
             )
+
             this_component = utils.downsample_with_shift_and_size(
-                x=psf_model, factor=factor, out_size=(nx, ny), shift=(dx, dy),
+                x=psf_model_oversampled,
+                factor=factor,
+                out_size=(nx, ny),
+                shift=(dx, dy),
             )
             psf_models[psf_cid] = this_component.detach().cpu().numpy()
-        
-        sersic_cid_list = self.config['sersic'].keys()
-        for sersic_cid in sersic_cid_list:
-            sersic_params = self._get_model_params(sersic_cid)
-            sersic_model = galaxy.full_sersic_model_torch(
+
+        # 3b) Sérsic components: sersic.<cid>.<filter>.*
+        for sersic_cid in self.config['sersic'].keys():
+            sersic_group = f'sersic.{sersic_cid}.{filter}'   # e.g. "sersic.s0.f115w"
+            sersic_params = self._get_model_params(sersic_group)
+
+            sersic_model_oversampled = galaxy.full_sersic_model_torch(
                 xx, yy, psf_tensor, **sersic_params
             )
+
             this_component = utils.downsample_with_shift_and_size(
-                x=sersic_model, factor=factor, out_size=(nx, ny), shift=(dx, dy),
+                x=sersic_model_oversampled,
+                factor=factor,
+                out_size=(nx, ny),
+                shift=(dx, dy),
             )
             sersic_models[sersic_cid] = this_component.detach().cpu().numpy()
-        
+
         return sersic_models, psf_models
 
     def get_fitted_components(self):
