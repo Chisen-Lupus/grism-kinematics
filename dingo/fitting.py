@@ -244,10 +244,28 @@ class BaseFitter(ABC):
         self.name   = s['name']
         self.ra     = s['ra']
         self.dec    = s['dec']
-        self.z      = s['z']
+        self.z      = s.get('z', None) # z 对 ImagesFitter 来说不再必须；KinematicsFitter 仍然会用到
         self.filter = s['filter']
         self.mode   = s['mode']
-        self.r_fit  = s.get('r_fit', None)
+        self.r_fit = s.get('r_fit', None)
+        if self.r_fit is not None:
+            LOG.warning(
+                f"[{self.__class__.__name__}] summary.r_fit is deprecated under (x,y) origin=(0,0). "
+                "Prefer explicit cutouts/centers in the config."
+            )
+
+
+        # ─────────────────────────────
+        # 坐标单位：pix / arcsec / kpc
+        # ─────────────────────────────
+        self.unit = s.get('unit', 'pix')
+        if self.unit not in ('pix', 'arcsec', 'kpc'):
+            LOG.warning(
+                f"[{self.__class__.__name__}] Unknown summary.unit={self.unit!r}; "
+                "fallback to 'pix'."
+            )
+            self.unit = 'pix'
+        LOG.info(f"[{self.__class__.__name__}] using coordinate unit = {self.unit}")
 
         # ─────────────────────────────
         # Fitting stage state
@@ -597,18 +615,22 @@ class KinematicsFitter(BaseFitter):
             torch.arange(nx), torch.arange(ny), indexing='ij'
         )
 
-        cxR, cyR = self.fwd_models['R'](
-            torch.tensor(self.r_fit, device=self.device), 
-            torch.tensor(self.r_fit, device=self.device), 
-            self.lambda_rest
-        )
-        cxC, cyC = self.fwd_models['C'](
-            torch.tensor(self.r_fit, device=self.device), 
-            torch.tensor(self.r_fit, device=self.device), 
-            self.lambda_rest
-        )
-        self.cutout_R = (int(cxR)-self.r_fit, int(cyR)-self.r_fit, 2*self.r_fit+1, 2*self.r_fit+1)
-        self.cutout_C = (int(cxC)-self.r_fit, int(cyC)-self.r_fit, 2*self.r_fit+1, 2*self.r_fit+1)
+        # cxR, cyR = self.fwd_models['R'](
+        #     torch.tensor(self.r_fit, device=self.device), 
+        #     torch.tensor(self.r_fit, device=self.device), 
+        #     self.lambda_rest
+        # )
+        # cxC, cyC = self.fwd_models['C'](
+        #     torch.tensor(self.r_fit, device=self.device), 
+        #     torch.tensor(self.r_fit, device=self.device), 
+        #     self.lambda_rest
+        # )
+        # self.cutout_R = (int(cxR)-self.r_fit, int(cyR)-self.r_fit, 2*self.r_fit+1, 2*self.r_fit+1)
+        # self.cutout_C = (int(cxC)-self.r_fit, int(cyC)-self.r_fit, 2*self.r_fit+1, 2*self.r_fit+1)
+        
+        self.cutout_R = tuple(img_cfg['R']['cutout'])
+        self.cutout_C = tuple(img_cfg['C']['cutout'])
+
 
     def _reset_state(self):
         # reset XY before each stage
@@ -716,20 +738,21 @@ class ImagesFitter(BaseFitter):
 
         # load image data
         self.direct_images = {} # {filter: {iid: {property: value}}}
-        for filter, imgs_cfg in self.config['direct'].items():
-            self.direct_images[filter] = {}
+        for filter_name, imgs_cfg in self.config['direct'].items():
+            self.direct_images[filter_name] = {}
             for iid, img_cfg in imgs_cfg.items():
                 # register psf
                 pid = img_cfg['psf']
-                self.psfs[filter][pid]['image_map'].append(iid)
+                self.psfs[filter_name][pid]['image_map'].append(iid)
                 # add image data
                 img_data = load_fits_data(img_cfg['path'])
-                try: 
+                try:
                     err_data = load_fits_data([img_cfg['path'][0], 'ERR'])
-                except: 
-                    LOG.warning(f'No err image for {img_cfg['path']}')
+                # TODO: make error image into 
+                except Exception:
+                    LOG.warning(f"No err image for {img_cfg['path']}")
                     err_data = np.ones_like(img_data)
-                if '_cutout' in img_cfg: 
+                if '_cutout' in img_cfg:
                     x, y, dx, dy = img_cfg['_cutout']
                     img_data = img_data[x:x+dx, y:y+dy]
                 img_tensor = torch.tensor(
@@ -743,9 +766,14 @@ class ImagesFitter(BaseFitter):
                 direct_info['image'] = img_tensor
                 direct_info['err'] = err_tensor
                 direct_info['oversample'] = img_cfg['oversample']
-                if self.psfs[filter][pid]['oversample']<direct_info['oversample']: 
+                if self.psfs[filter_name][pid]['oversample'] < direct_info['oversample']:
                     raise ValueError('PSF is not well-sampled!')
-                self.direct_images[filter][iid] = direct_info
+
+                # ── 这里根据 unit 预计算 “物理量→像素” 转换因子 ──
+                unit_factor = self._compute_unit_factor(filter_name, direct_info)
+                direct_info['unit_factor'] = unit_factor
+
+                self.direct_images[filter_name][iid] = direct_info
 
         # 2) Per-image grids: self.grids[filter][iid]
         self.grids = {}  # {filter: {iid: {'nx', 'ny', 'xx', 'yy'}}}
@@ -756,8 +784,8 @@ class ImagesFitter(BaseFitter):
                 img = direct_info['image']
                 nx, ny = img.shape
                 yy, xx = torch.meshgrid(
-                    torch.linspace(0, nx-1, nx, device=self.device),
-                    torch.linspace(0, ny-1, ny, device=self.device),
+                    torch.arange(nx, device=self.device, dtype=torch.float32),
+                    torch.arange(ny, device=self.device, dtype=torch.float32),
                     indexing='ij'
                 )
                 self.grids[filter][iid] = {
@@ -879,10 +907,30 @@ class ImagesFitter(BaseFitter):
                     grid = self.grids[filter][iid]
                     xx, yy = grid['xx'], grid['yy']
 
-                    factor = psf_info['oversample']//direct_info['oversample']
-                    direct_group = f'direct.{filter}.{iid}'
+                    # ----- oversample 因子：要求整除 -----
+                    psf_oversample = psf_info['oversample']
+                    img_oversample = direct_info['oversample']
+                    if psf_oversample % img_oversample != 0:
+                        raise ValueError(
+                            f"PSF oversample ({psf_oversample}) is not an integer multiple "
+                            f"of image oversample ({img_oversample}) for "
+                            f"filter={filter}, iid={iid}"
+                        )
+                    downsample_factor = psf_oversample // img_oversample
+
+                    direct_group = f"direct.{filter}.{iid}"
                     direct_params = self._get_model_params(direct_group)
-                    dx, dy, wt, zp = direct_params.values()
+                    # 显式按 key 取，避免 .values() 顺序问题
+                    dx = direct_params['dx']
+                    dy = direct_params['dy']
+                    wt = direct_params['wt']
+                    zp = direct_params['zp']
+
+                    # 物理单位 → 像素
+                    unit_factor = direct_info.get('unit_factor', 1.0)
+                    dx_pix = dx * unit_factor
+                    dy_pix = dy * unit_factor
+
 
                     # ----- 在该 iid 的网格上构建 oversampled model -----
                     model = 0
@@ -891,27 +939,41 @@ class ImagesFitter(BaseFitter):
                     for psf_cid in psf_cid_list:
                         psf_group = f'psf.{psf_cid}.{filter}' # e.g. psf.p0.f115w
                         psf_params = self._get_model_params(psf_group)
-                        psf_model = galaxy.full_psf_model_torch(xx, yy, psf_tensor, **psf_params)
+                        psf_params_pix = self._convert_geom_unit_to_pix(
+                            psf_params,
+                            geom_keys=('x_psf', 'y_psf'),
+                            unit_factor=direct_info['unit_factor'],
+                        )
+                        psf_model = galaxy.full_psf_model_torch(
+                            xx, yy, psf_tensor, **psf_params_pix
+                        )
                         model += psf_model
 
                     sersic_cid_list = self.config['sersic'].keys()
                     for sersic_cid in sersic_cid_list:
                         sersic_group = f'sersic.{sersic_cid}.{filter}'
                         sersic_params = self._get_model_params(sersic_group)
+                        sersic_params_pix = self._convert_geom_unit_to_pix(
+                            sersic_params,
+                            geom_keys=('x0', 'y0', 'R_e'),
+                            unit_factor=direct_info['unit_factor'],
+                        )
                         sersic_model = galaxy.full_sersic_model_torch(
-                            xx, yy, psf_tensor, **sersic_params
+                            xx, yy, psf_tensor, **sersic_params_pix
                         )
                         model += sersic_model
 
                     # ----- 下采样 + shift + loss（基本保持原来的逻辑） -----
-                    oversample = factor
                     combined_image_hat = torch.fft.fft2(model)
                     this_combined_image_hat = utils.fft_phase_shift(
                         combined_image_hat,
-                        dy*oversample,
-                        dx*oversample
+                        dy_pix * downsample_factor,
+                        dx_pix * downsample_factor,
                     )
-                    this_model_hat = utils.fft_bin(this_combined_image_hat, oversample)
+                    this_model_hat = utils.fft_bin(
+                        this_combined_image_hat,
+                        downsample_factor,
+                    )
                     this_model = torch.fft.ifft2(this_model_hat).real
 
                     # this_image = (this_image - zp)/wt
@@ -1032,7 +1094,15 @@ class ImagesFitter(BaseFitter):
         # 该 iid 的数据与 grid
         this_image = direct_info['image']
         nx, ny = this_image.shape
-        factor = psf_info['oversample'] // direct_info['oversample']
+        psf_oversample = psf_info['oversample']
+        img_oversample = direct_info['oversample']
+        if psf_oversample % img_oversample != 0:
+            raise ValueError(
+                f"PSF oversample ({psf_oversample}) is not an integer multiple "
+                f"of image oversample ({img_oversample}) for "
+                f"filter={filter}, iid={iid}"
+            )
+        downsample_factor = psf_oversample // img_oversample
 
         grid = self.grids[filter][iid]
         xx, yy = grid['xx'], grid['yy']
@@ -1042,6 +1112,12 @@ class ImagesFitter(BaseFitter):
         direct_params = self._get_model_params(direct_group)
         dx = direct_params['dx']
         dy = direct_params['dy']
+
+        # 单位转换
+        unit_factor = direct_info.get('unit_factor', 1.0)
+        dx_pix = dx * unit_factor
+        dy_pix = dy * unit_factor
+        # TODO: reopen wt and scale
         # wt = direct_params['wt']
         # zp = direct_params['zp']
 
@@ -1053,16 +1129,20 @@ class ImagesFitter(BaseFitter):
         for psf_cid in self.config['psf'].keys():
             psf_group = f'psf.{psf_cid}.{filter}'     # e.g. "psf.p0.f115w"
             psf_params = self._get_model_params(psf_group)
-
+            psf_params_pix = self._convert_geom_unit_to_pix(
+                psf_params,
+                geom_keys=('x_psf', 'y_psf'),
+                unit_factor=unit_factor
+            )
             psf_model_oversampled = galaxy.full_psf_model_torch(
-                xx, yy, psf_tensor, **psf_params
+                xx, yy, psf_tensor, **psf_params_pix
             )
 
             this_component = utils.downsample_with_shift_and_size(
                 x=psf_model_oversampled,
-                factor=factor,
+                factor=downsample_factor,
                 out_size=(nx, ny),
-                shift=(dx, dy),
+                shift=(dx_pix, dy_pix),
             )
             psf_models[psf_cid] = this_component.detach().cpu().numpy()
 
@@ -1070,16 +1150,20 @@ class ImagesFitter(BaseFitter):
         for sersic_cid in self.config['sersic'].keys():
             sersic_group = f'sersic.{sersic_cid}.{filter}'   # e.g. "sersic.s0.f115w"
             sersic_params = self._get_model_params(sersic_group)
-
+            sersic_params_pix = self._convert_geom_unit_to_pix(
+                sersic_params,
+                geom_keys=('x0', 'y0', 'R_e'),
+                unit_factor=unit_factor
+            )
             sersic_model_oversampled = galaxy.full_sersic_model_torch(
-                xx, yy, psf_tensor, **sersic_params
+                xx, yy, psf_tensor, **sersic_params_pix
             )
 
             this_component = utils.downsample_with_shift_and_size(
                 x=sersic_model_oversampled,
-                factor=factor,
+                factor=downsample_factor,
                 out_size=(nx, ny),
-                shift=(dx, dy),
+                shift=(dx_pix, dy_pix),
             )
             sersic_models[sersic_cid] = this_component.detach().cpu().numpy()
 
@@ -1166,3 +1250,133 @@ class ImagesFitter(BaseFitter):
         sersic_models, psf_models = self.get_oversampled_fitted_component(filter, iid)
         model = np.sum(list(sersic_models.values())+list(psf_models.values()), axis=0)
         return model
+    
+    # ======================================================================
+    # helper: 为当前 filter 找一个参考 redshift（用于 kpc 转换）
+    # ======================================================================
+    def _get_reference_z_for_filter(self, filter_name: str):
+        """
+        为某个 filter 选一个参考 redshift：
+          1. 优先从 sersic 组件中找 sersic.<cid>.<filter>.z
+          2. 找不到时 fallback 到 summary.z（如果有的话）
+          3. 都没有则返回 None
+        """
+        # 1) 在 sersic 组件中寻找
+        try:
+            for cid, per_filter in self.config.get('sersic', {}).items():
+                if filter_name in per_filter:
+                    z_here = per_filter[filter_name].get('z', None)
+                    if z_here is not None:
+                        return z_here
+        except Exception:
+            pass
+
+        # TODO: now we allow no z so z can be _z. change all optional variable occurences
+        # 2) fallback: summary.z
+        if getattr(self, 'z', None) is not None:
+            LOG.warning(
+                f"[ImagesFitter] No per-component z found for filter={filter_name!r}; "
+                "fall back to summary.z for kpc conversion."
+            )
+            return self.z
+
+        # 3) 全部失败
+        return None
+
+    # ======================================================================
+    # helper: 根据 self.unit 计算某个 direct image 的 “物理量 → 像素” 转换因子
+    # ======================================================================
+    def _compute_unit_factor(self, filter_name: str, direct_info: dict) -> float:
+        """
+        返回 factor:   pix = factor * (stored_unit)
+
+        其中 stored_unit 是当前 self.unit 下的单位：
+          - unit == 'pix'   → factor = 1
+          - unit == 'arcsec'→ factor = pix_per_arcsec
+          - unit == 'kpc'   → factor = pix_per_kpc (需要 redshift)
+        """
+        oversample = direct_info['oversample']
+
+        # 1) 纯像素：不需要转换
+        if self.unit == 'pix':
+            return 1.0
+
+        # 2) arcsec：依赖 pixel scale
+        if self.unit == 'arcsec':
+            try:
+                pixscale_arcsec = utils.nircam_miri_pixscale(
+                    filter_name, oversample=oversample
+                )  # arcsec / pixel
+                # 我们希望： dx_pix = dx_arcsec * pix_per_arcsec
+                pix_per_arcsec = 1.0 / float(pixscale_arcsec)
+                return pix_per_arcsec
+            except Exception as e:
+                LOG.warning(
+                    f"[ImagesFitter] nircam_miri_pixscale failed for "
+                    f"filter={filter_name!r}, oversample={oversample}: {e}; "
+                    "use factor=1."
+                )
+                return 1.0
+
+        # 3) kpc：需要 redshift
+        if self.unit == 'kpc':
+            z_ref = self._get_reference_z_for_filter(filter_name)
+            if z_ref is None:
+                LOG.warning(
+                    f"[ImagesFitter] Cannot find reference z for filter={filter_name!r} "
+                    "under unit='kpc'; use factor=1."
+                )
+                return 1.0
+
+            try:
+                kpc_per_pix, pix_per_kpc, pixscale_arcsec = utils.kpc_pix_scale(
+                    z_ref, filter_name, oversample=oversample
+                )
+                # 我们希望： dx_pix = dx_kpc * pix_per_kpc
+                return float(pix_per_kpc)
+            except Exception as e:
+                LOG.warning(
+                    f"[ImagesFitter] kpc_pix_scale failed for "
+                    f"filter={filter_name!r}, z={z_ref}, oversample={oversample}: {e}; "
+                    "use factor=1."
+                )
+                return 1.0
+
+        # 理论上不会走到这里，因为 BaseFitter 已经保证 unit 合法
+        return 1.0
+
+    def _convert_geom_unit_to_pix(
+        self,
+        params: dict,
+        *,
+        geom_keys: tuple,
+        unit_factor: float
+    ) -> dict:
+        """
+        Convert geometry-related parameters from current unit to pixel.
+
+        Parameters
+        ----------
+        params : dict
+            Output of self._get_model_params(...), values are torch tensors.
+        geom_keys : tuple
+            Parameter names that represent geometric quantities
+            (e.g. ('x0','y0','R_e') or ('x_psf','y_psf')).
+        unit_factor : float
+            Conversion factor such that:
+                value_pix = value * unit_factor
+
+        Returns
+        -------
+        params_pix : dict
+            A shallow-copied dict safe to pass into galaxy models.
+        """
+        params_pix = {}
+
+        for k, v in params.items():
+            if k in geom_keys:
+                params_pix[k] = v * unit_factor
+            else:
+                params_pix[k] = v
+
+        return params_pix

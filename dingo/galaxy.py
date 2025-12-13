@@ -204,39 +204,45 @@ def full_sersic_model_torch(x, y, psf, **kwargs):
 
 def full_psf_model_torch(x, y, psf, x_psf, y_psf, I_psf):
     """
-    使用 FFT phase shift 在整帧上生成一个带 sub-pixel 位置的 PSF 模型。
+    在整帧上生成一个带 sub-pixel 位置的 PSF 模型（坐标原点为 (0,0)）。
+
+    坐标约定
+    --------
+    - x_psf, y_psf 是输出图像中的“绝对像素坐标”：
+        x: 列方向 [0, W-1]
+        y: 行方向 [0, H-1]
+    - 不做任何中心化/翻转假设；显示时若要左下角原点，用 imshow(origin='lower')。
 
     Parameters
     ----------
     x, y : (H, W) torch.Tensor
-        坐标网格（这里只用 shape，不用具体数值）。
+        坐标网格（这里只使用 shape）。
     psf : (P, P) torch.Tensor
-        PSF kernel（居中）。
+        PSF kernel（其自身应当是“中心在数组中心”的常规 PSF stamp）。
     x_psf, y_psf : float or 0D tensor
-        PSF 在输出图像坐标中的中心位置（列、行）。
+        PSF 中心在输出图像坐标中的位置（绝对像素坐标）。
     I_psf : float or 0D tensor
         PSF 总 flux（缩放因子）。
 
     Returns
     -------
     image : (H, W) torch.Tensor
-        在 (x_psf, y_psf) 处的 PSF 图像。
     """
     H, W = x.shape
     device = x.device
     dtype  = x.dtype
 
-    # ---- 1) 把 psf 放在帧中心 ----
+    # ---- 1) 把 PSF stamp 插入到一个空帧的“参考位置” ----
     frame = torch.zeros((H, W), dtype=dtype, device=device)
 
     P = psf.shape[-1]
-    # 帧中心坐标（浮点）
-    cx = (W - 1)/2.0
-    cy = (H - 1)/2.0
 
-    # 以中心为参考，把 PSF 的整数部分放进去
-    x_base = int(cx) - P//2
-    y_base = int(cy) - P//2
+    # reference position：我们选“帧的几何中心”作为 FFT shift 的参考点（纯内部实现细节）
+    x_ref = (W - 1)/2.0
+    y_ref = (H - 1)/2.0
+
+    x_base = int(x_ref) - P//2
+    y_base = int(y_ref) - P//2
 
     x_start = max(x_base, 0)
     y_start = max(y_base, 0)
@@ -250,19 +256,17 @@ def full_psf_model_torch(x, y, psf, x_psf, y_psf, I_psf):
 
     frame[y_start:y_end, x_start:x_end] = psf[psf_y_start:psf_y_end, psf_x_start:psf_x_end].to(dtype)
 
-    # ---- 2) 在频域做平移：中心 -> (x_psf, y_psf) ----
-    # shifts: 输出坐标系里, 列方向 dx, 行方向 dy
+    # ---- 2) 频域平移：把参考位置移动到 (x_psf, y_psf) ----
     x0 = torch.as_tensor(x_psf, device=device, dtype=torch.float64)
     y0 = torch.as_tensor(y_psf, device=device, dtype=torch.float64)
-    dx = x0 - cx
-    dy = y0 - cy
 
-    F0 = torch.fft.fft2(frame)                 # complex
+    dx = x0 - x_ref   # 列方向平移
+    dy = y0 - y_ref   # 行方向平移
+
+    F0 = torch.fft.fft2(frame)
     F_shifted = utils.fft_phase_shift(F0, dx, dy)
     image = torch.fft.ifft2(F_shifted).real.to(dtype)
 
-    # ---- 3) 乘上 I_psf ----
+    # ---- 3) 缩放 ----
     I0 = torch.as_tensor(I_psf, device=device, dtype=dtype)
-    image = image*I0
-
-    return image
+    return image*I0

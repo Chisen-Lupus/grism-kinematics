@@ -5,6 +5,7 @@ from astropy.modeling.models import Gaussian2D
 from scipy.special import gammaincinv
 from scipy.signal import fftconvolve
 import logging
+from astropy.cosmology import Planck18 as cosmo
 
 from . import grism
 
@@ -595,4 +596,47 @@ def fft_phase_shift(F, dx, dy):
     return F_shifted
 
 
+def nircam_miri_pixscale(fn, oversample=3):
+    """
+    返回 oversample 后的 pixel scale (arcsec/pixel)。
+    SW   → 0.031"
+    LW   → 0.063"
+    MIRI → 0.11"
+    """
+    try:
+        lam = int(fn[1:4])   # e.g. 'f115w'→115, 'f770w'→770
+    except Exception:
+        LOG.warning(
+            f"[nircam_miri_pixscale] Cannot parse wavelength from filter name {fn!r}; "
+            "return pixscale=1 arcsec/pixel as fallback."
+        )
+        return 1.0
 
+    if lam < 240:       # NIRCam SW
+        native_scale = 0.031
+    elif lam < 500:     # NIRCam LW
+        native_scale = 0.063
+    else:               # MIRI
+        native_scale = 0.11
+
+    return native_scale / float(oversample)
+
+
+def kpc_pix_scale(z, filt, oversample=3):
+    """
+    返回:
+      kpc_per_pix, pix_per_kpc, pixscale_arcsec
+    其中 pixel scale 由 nircam_miri_pixscale 统一处理。
+    """
+
+    # 直接复用 pixel scale 函数
+    pixscale_arcsec = nircam_miri_pixscale(filt, oversample)
+
+    # 角径距离：1 arcsec 对应多少 kpc
+    kpc_per_arcsec = cosmo.kpc_proper_per_arcmin(z).to('kpc/arcsec').value
+
+    # 换算
+    kpc_per_pix = kpc_per_arcsec * pixscale_arcsec
+    pix_per_kpc = 1.0 / kpc_per_pix
+
+    return kpc_per_pix, pix_per_kpc, pixscale_arcsec
